@@ -1,18 +1,29 @@
 """Buy-Side Macro Quant Portal — self-contained Streamlit dashboard."""
 from __future__ import annotations
 
-from datetime import date, timedelta
-from io import StringIO
+from datetime import date, datetime, time as dt_time, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO, StringIO
+from pathlib import Path
 from urllib.request import Request, urlopen
 import hmac
+import hashlib
+import html
+import json
+import re
+import zipfile
+from xml.etree import ElementTree as ET
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import pytz
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
+from ui_theme import inject_theme, apply_quant_theme
 
 try:
     from scipy.signal import argrelextrema
@@ -136,39 +147,43 @@ YIELD_TICKERS = {"3M": "^IRX", "5Y": "^FVX", "10Y": "^TNX", "30Y": "^TYX"}
 PERIOD_BARS = {"1M":21,"3M":63,"6M":126,"YTD":None,"1Y":252,"3Y":756,"5Y":1260,"10Y":2520,"MAX":None}
 REGIME_PAIRS = {"QQQ / TQQQ":("QQQ","TQQQ"),"SPY / SPXL":("SPY","SPXL"),
                 "SOXX / SOXL":("SOXX","SOXL"),"XLK / TECL":("XLK","TECL")}
+AI_THEMES = {
+    "宏观 11 大行业 ETF": ["XLK","XLE","XLI","XLY","XLC","XLF","XLV","XLP","XLU","XLRE","XLB","SMH"],
+    "AI 算力与半导体龙头": ["NVDA","AMD","TSM","AVGO","ASML","MU"],
+    "AI 物理基建 (电力/核能/液冷)": ["VST","CEG","CCJ","OKLO","VRT","ETN"],
+    "关键资源与地缘避险": ["FCX","CPER","LMT","RTX","ITA","XLE"],
+}
+TACTICAL_NAMES = {
+    "NVDA":"NVIDIA","AMD":"Advanced Micro Devices","TSM":"TSMC","AVGO":"Broadcom","ASML":"ASML Holding","MU":"Micron",
+    "VST":"Vistra","CEG":"Constellation Energy","CCJ":"Cameco","OKLO":"Oklo","VRT":"Vertiv","ETN":"Eaton",
+    "FCX":"Freeport-McMoRan","CPER":"Copper ETF","LMT":"Lockheed Martin","RTX":"RTX","ITA":"Aerospace & Defense ETF",
+    "SMH":"Semiconductor ETF",
+}
+OPTION_POOL = ("QQQ","SPY","SMH","SOXX","NVDA","TSLA","MU","ITA","XLE")
+LEVERAGED_ETFS = ("TQQQ","SOXL")
+PRIMARY_FLOW_ETFS = {
+    "TQQQ": {"label":"TQQQ (3x 纳指)","threshold":500_000_000.0,"class":"杠杆 ETF"},
+    "SOXL": {"label":"SOXL (3x 半导体)","threshold":500_000_000.0,"class":"杠杆 ETF"},
+    "QQQ": {"label":"QQQ (纳指基准)","threshold":1_500_000_000.0,"class":"基石 ETF"},
+    "SPY": {"label":"SPY (标普基准)","threshold":1_500_000_000.0,"class":"基石 ETF"},
+}
 COLORS = {
     "XLK": "#40c4ff", "XLC": "#8b7cff", "XLY": "#ff8f5a", "XLI": "#b7c5d8", "XLE": "#00d7a3",
     "XLF": "#3a86ff", "XLV": "#ff4d76", "XLP": "#e6c85c", "XLU": "#5c7cfa", "XLRE": "#b985ff",
     "XLB": "#8bcf74", "SMH": "#ff3e68", "GLD": "#f3c94f", "SLV": "#c6d0dc", "USO": "#f26d4b",
     "CPER": "#d99152", "UUP": "#38bdf8", "TLT": "#a78bfa", "QQQ": "#ff8a3d",
 }
-PAPER, PLOT, GRID = "#070b12", "#0a111c", "rgba(135,151,174,.13)"
-
-st.markdown("""
-<style>
-.stApp{background:radial-gradient(circle at 75% -20%,#14243b 0,#080d15 43%,#05080e 100%)}
-.block-container{max-width:1900px;padding:4.75rem 1.65rem 2rem}
-[data-testid="stHeader"]{background:#080c12;border-bottom:1px solid #171f2b}
-[data-testid="stSidebar"]{background:#070c13;border-right:1px solid #1a2738}
-[data-testid="stMetric"]{background:linear-gradient(145deg,#101a28,#090f18);border:1px solid #1c2c42;padding:.78rem .9rem;border-radius:5px;min-height:104px}
-[data-testid="stMetricLabel"]{color:#8799b2;font-size:.73rem;letter-spacing:.055em;text-transform:uppercase}
-[data-testid="stMetricValue"]{color:#f2f6fc;font:600 1.44rem ui-monospace,SFMono-Regular,Consolas,monospace}
-[data-testid="stMetricDelta"]{font:500 .76rem ui-monospace,SFMono-Regular,Consolas,monospace}
-[data-testid="stTabs"] button{font-size:.76rem;font-weight:700;letter-spacing:.075em;color:#8292a8;padding:.72rem 1.15rem}
-[data-testid="stTabs"] button[aria-selected="true"]{color:#43d8ff}
-[data-testid="stTabs"] [data-baseweb="tab-highlight"]{background:#35d5ff}
-[data-testid="stDataFrame"]{border:1px solid #1a293d;border-radius:4px}
-.portal-head{display:flex;align-items:end;justify-content:space-between;border-bottom:1px solid #1b2a3e;padding:.25rem 0 .85rem;margin-bottom:.75rem}
-.portal-title{font-size:1.42rem;font-weight:700;letter-spacing:.08em;color:#edf4ff}.portal-sub{font-size:.7rem;color:#6f829d;letter-spacing:.13em;margin-top:.25rem}
-.live{font:600 .7rem ui-monospace,monospace;color:#46dda9;letter-spacing:.08em}.live:before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:#2bd9a3;box-shadow:0 0 9px #2bd9a3;margin-right:7px}
-.deck-label{font-size:.64rem;color:#52657d;letter-spacing:.16em;text-transform:uppercase;margin:.25rem 0 .42rem}
-.module{border-left:2px solid #35d5ff;padding-left:.72rem;margin:.3rem 0 .48rem}.kicker{font-size:.61rem;color:#37d6ff;font-weight:750;letter-spacing:.16em;text-transform:uppercase}
-.module-title{font-size:1rem;color:#e8eff9;font-weight:650;margin-top:.1rem}.module-note{font-size:.7rem;color:#7588a2;margin-top:.12rem}
-hr{border-color:#192638!important;margin:.85rem 0!important}div[data-testid="stAlert"]{border-radius:4px}
-</style>""", unsafe_allow_html=True)
+with st.sidebar:
+    theme_choice = st.selectbox(
+        "🎨 终端皮肤风格 (Theme HUD)",
+        ["Bloomberg Pro (买方经典)", "Cyberpunk 2077 (赛博朋克)", "Matrix Green (黑客终端)"],
+        index=1,
+        key="portal_theme_choice",
+    )
+inject_theme(st.session_state.portal_theme_choice)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def load_prices(tickers: tuple[str, ...], start: date, end: date) -> pd.DataFrame:
     """Bulk-download adjusted closes and normalize yfinance output shapes."""
     raw = yf.download(list(tickers), start=start, end=end, auto_adjust=True, progress=False, threads=True, group_by="column")
@@ -188,7 +203,55 @@ def load_prices(tickers: tuple[str, ...], start: date, end: date) -> pd.DataFram
     return close.reindex(columns=list(tickers)).apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).sort_index()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=45,show_spinner=False)
+def fetch_live_pulse() -> pd.DataFrame:
+    """Lightweight intraday tape isolated from the 15-minute research cache."""
+    symbols=("SPY","QQQ","IWM","^VIX"); eastern=pytz.timezone("US/Eastern")
+
+    def close_panel(raw: pd.DataFrame) -> pd.DataFrame:
+        if raw is None or raw.empty: return pd.DataFrame(columns=symbols)
+        if isinstance(raw.columns,pd.MultiIndex):
+            level0=raw.columns.get_level_values(0)
+            panel=raw["Close"].copy() if "Close" in level0 else raw.xs("Close",axis=1,level=1).copy()
+        else:
+            panel=raw[["Close"]].copy(); panel.columns=[symbols[0]]
+        if isinstance(panel,pd.Series): panel=panel.to_frame()
+        return panel.reindex(columns=symbols).apply(pd.to_numeric,errors="coerce")
+
+    try:
+        minute_raw=yf.download(list(symbols),period="5d",interval="1m",prepost=True,auto_adjust=False,
+                               progress=False,threads=True,group_by="column")
+    except Exception:
+        minute_raw=pd.DataFrame()
+    try:
+        daily_raw=yf.download(list(symbols),period="10d",interval="1d",auto_adjust=False,
+                              progress=False,threads=True,group_by="column")
+    except Exception:
+        daily_raw=pd.DataFrame()
+    minute,daily=close_panel(minute_raw),close_panel(daily_raw)
+    rows=[]
+    for symbol in symbols:
+        intraday=minute[symbol].dropna() if symbol in minute else pd.Series(dtype=float)
+        day=daily[symbol].dropna() if symbol in daily else pd.Series(dtype=float)
+        latest=np.nan; previous=np.nan; stamp=pd.NaT
+        if not intraday.empty:
+            latest=float(intraday.iloc[-1]); stamp=pd.Timestamp(intraday.index[-1])
+            if stamp.tzinfo is None: stamp=eastern.localize(stamp.to_pydatetime())
+            else: stamp=stamp.tz_convert(eastern)
+            day_dates=[pd.Timestamp(index).date() for index in day.index]
+            if day_dates:
+                previous=float(day.iloc[-2] if day_dates[-1]>=stamp.date() and len(day)>=2 else day.iloc[-1])
+        elif not day.empty:
+            latest=float(day.iloc[-1]); previous=float(day.iloc[-2]) if len(day)>=2 else np.nan
+            stamp=pd.Timestamp(day.index[-1])
+            stamp=eastern.localize(datetime.combine(stamp.date(),dt_time(16,0)))
+        change=(latest/previous-1)*100 if np.isfinite(latest) and np.isfinite(previous) and previous!=0 else np.nan
+        rows.append({"Ticker":"VIX" if symbol=="^VIX" else symbol,"YahooTicker":symbol,"Price":latest,
+                     "ChangePct":change,"QuoteTimeET":stamp})
+    return pd.DataFrame(rows).set_index("Ticker")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def load_custom_prices(tickers: tuple[str, ...], period: str) -> pd.DataFrame:
     """Fetch arbitrary user-entered tickers without requiring a local data file."""
     raw = yf.download(list(tickers), period=period, auto_adjust=True, progress=False, threads=True, group_by="column")
@@ -208,7 +271,7 @@ def load_custom_prices(tickers: tuple[str, ...], period: str) -> pd.DataFrame:
     return close.reindex(columns=list(tickers)).apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).sort_index()
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def load_sp500_companies() -> tuple[str, ...]:
     """Load a 500-company breadth universe (secondary duplicate share classes removed)."""
     # CSV-only sources keep Community Cloud deployment independent of optional lxml/html parsers.
@@ -232,7 +295,7 @@ def load_sp500_companies() -> tuple[str, ...]:
     return tuple(symbols[:500])
 
 
-@st.cache_data(ttl=3600,show_spinner=False)
+@st.cache_data(ttl=900,show_spinner=False)
 def load_sp500_breadth_prices(symbols: tuple[str,...]) -> pd.DataFrame:
     """Chunk the breadth download to reduce partial failures and Yahoo throttling."""
     parts=[]
@@ -246,7 +309,7 @@ def load_sp500_breadth_prices(symbols: tuple[str,...]) -> pd.DataFrame:
     return pd.concat(parts,axis=1).reindex(columns=list(symbols)) if parts else pd.DataFrame(columns=list(symbols))
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def load_flow_data(tickers: tuple[str, ...], period: str = "3mo") -> tuple[pd.DataFrame, pd.DataFrame]:
     """Download adjusted closes and volume for signed-dollar-volume flow proxies."""
     raw = yf.download(list(tickers), period=period, auto_adjust=True, progress=False, threads=True, group_by="column")
@@ -264,7 +327,7 @@ def load_flow_data(tickers: tuple[str, ...], period: str = "3mo") -> tuple[pd.Da
             volume.reindex(columns=list(tickers)).apply(pd.to_numeric,errors="coerce"))
 
 
-@st.cache_data(ttl=3600,show_spinner=False)
+@st.cache_data(ttl=900,show_spinner=False)
 def load_ohlcv(tickers: tuple[str,...], period: str = "max") -> pd.DataFrame:
     """Batch-download full adjusted OHLCV history and return ticker-first columns."""
     raw=yf.download(list(tickers),period=period,auto_adjust=True,progress=False,threads=True,group_by="ticker")
@@ -318,6 +381,538 @@ def load_market_news(symbols: tuple[str, ...], per_symbol: int = 6) -> pd.DataFr
     result["Time"] = pd.to_datetime(result["Time"],utc=True,errors="coerce")
     result["Time"] = result["Time"].dt.tz_convert("Asia/Tokyo").dt.strftime("%m-%d %H:%M")
     return result.head(24)
+
+
+def us_market_status(now_et: datetime | None = None) -> dict[str,str]:
+    """US/Eastern session badge and countdown using weekday cash-session conventions."""
+    eastern=pytz.timezone("US/Eastern")
+    now=now_et or datetime.now(eastern)
+    if now.tzinfo is None:
+        now=eastern.localize(now)
+    today=now.date(); clock=now.time().replace(tzinfo=None); weekday=now.weekday()
+    pre_open,regular_open,regular_close,after_close=dt_time(4,0),dt_time(9,30),dt_time(16,0),dt_time(20,0)
+    if weekday<5 and pre_open<=clock<regular_open:
+        label,color,event="🟡 PRE-MARKET","#f6c453","距离开盘"
+        target=eastern.localize(datetime.combine(today,regular_open))
+    elif weekday<5 and regular_open<=clock<regular_close:
+        label,color,event="🟢 MARKET OPEN","#31d6a0","距离收盘"
+        target=eastern.localize(datetime.combine(today,regular_close))
+    elif weekday<5 and regular_close<=clock<after_close:
+        label,color,event="🔵 AFTER-HOURS","#4f86d9","距离下次开盘"
+        next_day=today+timedelta(days=1)
+        while next_day.weekday()>=5: next_day+=timedelta(days=1)
+        target=eastern.localize(datetime.combine(next_day,regular_open))
+    else:
+        label,color,event="🔴 MARKET CLOSED","#697689","距离下次开盘"
+        next_day=today if weekday<5 and clock<regular_open else today+timedelta(days=1)
+        while next_day.weekday()>=5: next_day+=timedelta(days=1)
+        target=eastern.localize(datetime.combine(next_day,regular_open))
+    seconds=max(0,int((target-now).total_seconds())); hours,rem=divmod(seconds,3600); minutes=rem//60
+    return {"label":label,"color":color,"time":now.strftime("%Y-%m-%d %H:%M ET"),
+            "countdown":f"{event} {hours:02d}h {minutes:02d}m"}
+
+
+@st.cache_data(ttl=900,show_spinner=False)
+def load_option_snapshot(symbol: str,max_expiries: int=2) -> tuple[pd.DataFrame,float]:
+    """Download 7-30 DTE option chains; individual expiries fail independently."""
+    ticker=yf.Ticker(symbol); spot=np.nan
+    try:
+        spot=float(ticker.fast_info["last_price"])
+    except Exception:
+        try:
+            history=ticker.history(period="5d",auto_adjust=True)
+            spot=float(history["Close"].dropna().iloc[-1])
+        except Exception:
+            pass
+    try:
+        expiries=list(ticker.options or [])
+    except Exception:
+        expiries=[]
+    today=datetime.now(pytz.timezone("US/Eastern")).date(); selected=[]
+    for expiry in expiries:
+        try:
+            dte=(pd.Timestamp(expiry).date()-today).days
+            if 7<=dte<=30: selected.append(expiry)
+        except Exception:
+            continue
+    frames=[]
+    for expiry in selected[:max(1,max_expiries)]:
+        try:
+            chain=ticker.option_chain(expiry)
+            for option_type,source in (("Call",chain.calls),("Put",chain.puts)):
+                frame=source.copy()
+                if frame.empty: continue
+                frame["Type"]=option_type; frame["Expiration"]=expiry
+                frames.append(frame)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame(),spot
+    result=pd.concat(frames,ignore_index=True)
+    for column in ("strike","volume","openInterest","impliedVolatility","bid","ask","lastPrice"):
+        if column not in result: result[column]=np.nan
+        result[column]=pd.to_numeric(result[column],errors="coerce")
+    return result,spot
+
+
+def unusual_option_rows(chain: pd.DataFrame,spot: float,ratio_floor: float=1.5,volume_floor: int=1000,
+                        moneyness_limit: float=.20) -> pd.DataFrame:
+    if chain.empty or not np.isfinite(spot):
+        return pd.DataFrame(columns=["Expiration","Strike","Moneyness","Type","Vol","OI","Vol/OI","IV","Signal"])
+    data=chain.copy(); data["volume"]=data["volume"].fillna(0); data["openInterest"]=data["openInterest"].fillna(0)
+    data["Vol/OI"]=data["volume"].div(data["openInterest"].replace(0,np.nan))
+    data["Moneyness"]=data["strike"].sub(spot).div(spot).mul(100)
+    otm=((data["Type"]=="Call")&(data["strike"]>spot))|((data["Type"]=="Put")&(data["strike"]<spot))
+    near_spot=data["strike"].sub(spot).abs().div(spot)<=moneyness_limit
+    data=data[otm&near_spot&(data["volume"]>=volume_floor)&(data["Vol/OI"]>=ratio_floor)].copy()
+    if data.empty:
+        return pd.DataFrame(columns=["Expiration","Strike","Moneyness","Type","Vol","OI","Vol/OI","IV","Signal"])
+    data["Signal"]=np.where(data["Type"].eq("Call"),"🔥 OTM Call 异动","🛡️ OTM Put 异动")
+    data["IV"]=data["impliedVolatility"]*100
+    data=data.rename(columns={"strike":"Strike","volume":"Vol","openInterest":"OI"})
+    return data[["Expiration","Strike","Moneyness","Type","Vol","OI","Vol/OI","IV","Signal"]].sort_values(["Vol/OI","Vol"],ascending=False)
+
+
+def continuation_price_diagnostics(ohlcv: pd.DataFrame) -> dict:
+    """Diagnose whether a recent high-volume breakout is holding through consolidation."""
+    empty={"detected":False,"reason":"过去 10 个交易日未检测到 RVOL ≥ 2.0 且涨幅 ≥ 3% 的放量突破。"}
+    required={"High","Low","Close","Volume"}
+    if ohlcv is None or ohlcv.empty or not required.issubset(ohlcv.columns):
+        return empty
+    data=ohlcv[list(required)].apply(pd.to_numeric,errors="coerce").sort_index()
+    data=data.dropna(subset=["High","Low","Close","Volume"])
+    data=data[data["Volume"]>0]
+    if len(data)<22:
+        return {"detected":False,"reason":"有效 OHLCV 历史不足 22 个交易日，无法计算突破量比。"}
+
+    data["Return"]=data["Close"].pct_change()
+    # Exclude the event day from the denominator so RVOL is not diluted by itself.
+    data["AvgVolume20"]=data["Volume"].shift(1).rolling(20,min_periods=10).mean()
+    data["RVOL"]=data["Volume"].div(data["AvgVolume20"].replace(0,np.nan))
+    candidates=data.tail(10)
+    candidates=candidates[(candidates["RVOL"]>=2.0)&(candidates["Return"]>=.03)]
+    if candidates.empty:
+        return empty
+
+    anchor=pd.Timestamp(candidates.index[-1])
+    anchor_loc=int(data.index.get_loc(anchor)); anchored=data.loc[anchor:].copy()
+    typical=(anchored["High"]+anchored["Low"]+anchored["Close"])/3
+    cumulative_volume=anchored["Volume"].cumsum().replace(0,np.nan)
+    avwap=typical.mul(anchored["Volume"]).cumsum().div(cumulative_volume)
+    latest_price=float(data["Close"].iloc[-1]); latest_avwap=float(avwap.iloc[-1])
+    ema20=data["Close"].ewm(span=20,adjust=False,min_periods=20).mean()
+    latest_ema20=float(ema20.iloc[-1]) if np.isfinite(ema20.iloc[-1]) else np.nan
+    ema_distance=abs(latest_price/latest_ema20-1)*100 if np.isfinite(latest_ema20) and latest_ema20 else np.nan
+    breakout_volume=float(data.loc[anchor,"Volume"])
+    post_volume=data.loc[anchor:,"Volume"].iloc[1:]
+    dryup=float(post_volume.mean()/breakout_volume) if len(post_volume) and breakout_volume else np.nan
+    avwap_pass=bool(latest_price>=latest_avwap)
+    dryup_pass=bool(np.isfinite(dryup) and dryup<=.45)
+    ema_pass=bool(np.isfinite(ema_distance) and ema_distance<=2.5)
+
+    avwap_label="🟢 守住机构成本线" if avwap_pass else "🚨 跌破机构底线"
+    if not np.isfinite(dryup):
+        dryup_label="⏳ 突破刚发生，等待缩量样本"
+    elif dryup<=.45:
+        dryup_label="🟢 筹码高度锁仓 (成交量极度萎缩)"
+    elif dryup>.70:
+        dryup_label="⚠️ 放量滞涨 (警惕派发)"
+    else:
+        dryup_label="🟡 温和缩量，继续观察"
+    if not np.isfinite(ema_distance):
+        ema_label="⚪ EMA20 数据不足"
+    elif ema_distance<=2.5:
+        ema_label="🟢 均线回踩到位 (蓄势待发)"
+    elif ema_distance>6:
+        ema_label="⏳ 乖离过大 (仍在等待均线)"
+    else:
+        ema_label="🟡 均线靠拢中"
+    return {
+        "detected":True,"anchor":anchor,"days_since":len(data)-1-anchor_loc,
+        "breakout_return":float(data.loc[anchor,"Return"]*100),"breakout_rvol":float(data.loc[anchor,"RVOL"]),
+        "price":latest_price,"avwap":latest_avwap,"avwap_series":avwap,"avwap_pass":avwap_pass,
+        "dryup":dryup,"dryup_pass":dryup_pass,"ema20":latest_ema20,"ema_distance":ema_distance,
+        "ema_pass":ema_pass,"avwap_label":avwap_label,"dryup_label":dryup_label,"ema_label":ema_label,
+    }
+
+
+def continuation_option_oi_carry(symbol: str,chain: pd.DataFrame,spot: float) -> dict:
+    """Compare near-spot unusual Call OI across locally observed ET-date snapshots.
+
+    Yahoo exposes only current OI, not historical OI. This condition is counted only
+    after the session has observed the same contracts on at least two different ET dates.
+    """
+    neutral={"passed":None,"label":"⚪ OI 净增待次日快照确认","detail":"Yahoo 无历史 OI；首次观测不计分"}
+    if chain is None or chain.empty or not np.isfinite(spot):
+        return {"passed":None,"label":"⚪ 期权链不可用","detail":"本次抓取未返回 7–30 DTE 合约"}
+    data=chain.copy()
+    for column in ("strike","volume","openInterest"):
+        if column not in data: data[column]=np.nan
+        data[column]=pd.to_numeric(data[column],errors="coerce")
+    calls=data[(data.get("Type")=="Call")&(data["strike"]>=spot)&(data["strike"]<=spot*1.15)].copy()
+    if calls.empty:
+        return {"passed":None,"label":"⚪ 无近月近价 Call","detail":"现价上方 15% 内没有可跟踪合约"}
+    calls["volume"]=calls["volume"].fillna(0); calls["openInterest"]=calls["openInterest"].fillna(0)
+    calls["Vol/OI"]=calls["volume"].div(calls["openInterest"].replace(0,np.nan))
+    unusual=calls[(calls["volume"]>=500)&(calls["Vol/OI"]>=1.5)]
+
+    def contract_key(row: pd.Series) -> str:
+        raw=row.get("contractSymbol")
+        if pd.notna(raw) and str(raw): return str(raw)
+        return f"{row.get('Expiration','')}|{float(row['strike']):.3f}"
+
+    current_map={contract_key(row):float(row["openInterest"]) for _,row in calls.iterrows()}
+    watch=[contract_key(row) for _,row in unusual.iterrows()]
+    et_day=datetime.now(pytz.timezone("US/Eastern")).date().isoformat()
+    history=st.session_state.setdefault("_continuation_oi_history",{})
+    symbol_history=history.setdefault(symbol,{})
+    symbol_history[et_day]={"oi":current_map,"watch":watch}
+    for old_day in sorted(symbol_history)[:-4]:
+        symbol_history.pop(old_day,None)
+    observed_days=sorted(symbol_history)
+    if len(observed_days)<2:
+        if watch:
+            neutral["detail"]=f"已建立 {len(watch)} 张异动 Call 合约基线，待下一交易日复核"
+        else:
+            neutral["detail"]="今日未发现 Vol/OI ≥ 1.5 且 Vol ≥ 500 的近价 Call"
+        return neutral
+    prior=symbol_history[observed_days[-2]]; current=symbol_history[observed_days[-1]]
+    tracked=set(prior.get("watch",[])); common=tracked.intersection(current.get("oi",{}))
+    if not common:
+        return {"passed":None,"label":"⚪ OI Carry 暂不可比","detail":"前一快照异动合约已到期或未返回"}
+    delta=sum(current["oi"][key]-prior["oi"].get(key,0) for key in common)
+    if delta>0:
+        return {"passed":True,"label":"🟢 异动 Call OI 沉淀确认","detail":f"同合约 OI 净增 {delta:,.0f} 张"}
+    return {"passed":False,"label":"⚠️ Call OI 未沉淀","detail":f"同合约 OI 变化 {delta:,.0f} 张"}
+
+
+@st.cache_data(ttl=900,show_spinner=False)
+def load_theme_option_uoa(symbols: tuple[str,...]) -> pd.DataFrame:
+    """Scan one selected theme; a failure in one ticker/expiry never blocks the table."""
+    rows=[]
+    for symbol in symbols:
+        try:
+            chain,spot=load_option_snapshot(symbol,8)
+            unusual=unusual_option_rows(chain,spot,ratio_floor=1.5,volume_floor=500,moneyness_limit=.15)
+            if unusual.empty: continue
+            unusual.insert(0,"Ticker",symbol)
+            unusual["Signal"]=np.where(unusual["Type"].eq("Call"),
+                "🔥 近虚值 Call 抢筹候选","🛡️ 近虚值 Put 防守候选")
+            rows.append(unusual)
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame(columns=["Ticker","Expiration","Strike","Moneyness","Type","Vol","OI","Vol/OI","Signal"])
+    result=pd.concat(rows,ignore_index=True)
+    return result[["Ticker","Expiration","Strike","Moneyness","Type","Vol","OI","Vol/OI","Signal"]].sort_values(
+        ["Vol/OI","Vol"],ascending=False).reset_index(drop=True)
+
+
+def theme_tactical_scoreboard(price_frame: pd.DataFrame,ohlcv: pd.DataFrame,tickers: list[str],benchmark: str) -> pd.DataFrame:
+    """Cross-sectional price, relative-strength regime and relative-volume snapshot."""
+    rows=[]
+    for ticker in tickers:
+        if ticker not in price_frame or benchmark not in price_frame: continue
+        pair=price_frame[[ticker,benchmark]].dropna()
+        if len(pair)<200: continue
+        ratio=pair[ticker].div(pair[benchmark]).replace([np.inf,-np.inf],np.nan).dropna()
+        if len(ratio)<200: continue
+        latest=float(ratio.iloc[-1]); ema20=float(ratio.ewm(span=20,adjust=False).mean().iloc[-1])
+        ema50=float(ratio.ewm(span=50,adjust=False).mean().iloc[-1]); sma200=float(ratio.rolling(200,min_periods=200).mean().iloc[-1])
+        d20=(latest/ema20-1)*100 if ema20 else np.nan; d50=(latest/ema50-1)*100 if ema50 else np.nan
+        above20,above50,above200=latest>ema20,latest>ema50,latest>sma200
+        if above20 and above50 and above200: regime="🔥 绝对强势"
+        elif above20 and above50: regime="⚡ 超跌反弹"
+        elif above200: regime="⚠️ 强势回调"
+        else: regime="❄️ 弱势破位"
+        close=pair[ticker].dropna(); price=float(close.iloc[-1]); day_return=last_return(close,1)
+        rvol=np.nan
+        try:
+            ticker_frame=ohlcv[ticker].dropna(subset=["Close"]) if ticker in ohlcv.columns.get_level_values(0) else pd.DataFrame()
+            volume=pd.to_numeric(ticker_frame.get("Volume"),errors="coerce").dropna()
+            if len(volume)>=21 and float(volume.iloc[-21:-1].mean())>0:
+                rvol=float(volume.iloc[-1]/volume.iloc[-21:-1].mean())
+        except Exception:
+            pass
+        rows.append({
+            "Ticker":f"{ticker} · {TACTICAL_NAMES.get(ticker,SECTORS.get(ticker,(ticker,ticker,0))[1])}",
+            "Price":f"${price:,.2f} · {day_return:+.2f}%" if np.isfinite(day_return) else f"${price:,.2f}",
+            "RS vs 20EMA":f"{'🟢 Above' if above20 else '🔴 Below'} ({d20:+.2f}%)",
+            "RS vs 50EMA":f"{'🟢 Above' if above50 else '🔴 Below'} ({d50:+.2f}%)",
+            "RVOL (20D)":f"🔥 异常放量 · {rvol:.2f}x" if np.isfinite(rvol) and rvol>=1.8 else (f"{rvol:.2f}x" if np.isfinite(rvol) else "N/A"),
+            "Regime 状态定性":regime,
+            "_MomentumScore":float(np.nan_to_num(d20)+np.nan_to_num(d50)+np.nan_to_num(day_return)*.25),
+            "_RVOL":rvol,
+        })
+    return pd.DataFrame(rows)
+
+
+def option_skew_proxy(chain: pd.DataFrame,spot: float) -> tuple[float,pd.DataFrame]:
+    """±4% OTM IV ratio proxy; Yahoo's public chain does not include option delta."""
+    if chain.empty or not np.isfinite(spot): return np.nan,pd.DataFrame()
+    nearest_expiry=sorted(chain["Expiration"].dropna().astype(str).unique())[0]
+    subset=chain[chain["Expiration"].astype(str).eq(nearest_expiry)].copy()
+    calls=subset[subset["Type"].eq("Call")].dropna(subset=["strike","impliedVolatility"])
+    puts=subset[subset["Type"].eq("Put")].dropna(subset=["strike","impliedVolatility"])
+    if calls.empty or puts.empty: return np.nan,pd.DataFrame()
+    call_row=calls.iloc[(calls["strike"]-spot*1.04).abs().argsort()[:1]]
+    put_row=puts.iloc[(puts["strike"]-spot*.96).abs().argsort()[:1]]
+    put_iv=float(put_row["impliedVolatility"].iloc[0]); call_iv=float(call_row["impliedVolatility"].iloc[0])
+    ratio=call_iv/put_iv if put_iv>0 else np.nan
+    curve=subset[subset["strike"].between(spot*.75,spot*1.25)].copy()
+    return ratio,curve
+
+
+FLOW_RECORD_COLUMNS=["date","shares_outstanding","nav","source_url","source_note"]
+
+
+def _normalise_flow_records(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a strict, duplicate-free issuer record table; malformed rows are ignored."""
+    if frame is None or frame.empty: return pd.DataFrame(columns=FLOW_RECORD_COLUMNS)
+    clean=frame.copy()
+    for column in FLOW_RECORD_COLUMNS:
+        if column not in clean: clean[column]=""
+    clean["date"]=pd.to_datetime(clean["date"],errors="coerce").dt.tz_localize(None).dt.normalize()
+    clean["shares_outstanding"]=pd.to_numeric(clean["shares_outstanding"],errors="coerce")
+    clean["nav"]=pd.to_numeric(clean["nav"],errors="coerce")
+    clean=clean.dropna(subset=["date","shares_outstanding","nav"])
+    clean=clean[clean["shares_outstanding"].gt(0)&clean["nav"].gt(0)]
+    return clean[FLOW_RECORD_COLUMNS].sort_values("date").drop_duplicates("date",keep="last").reset_index(drop=True)
+
+
+def _read_baseline_records(symbol: str) -> pd.DataFrame:
+    data_dir=Path(__file__).resolve().parent/"data"; frames=[]
+    for path in (data_dir/f"{symbol.lower()}_shares_baseline.csv",
+                 data_dir/f"{symbol.lower()}_historical_shares.csv",
+                 data_dir/f"{symbol.lower()}_flow_history.csv"):
+        try:
+            if path.exists() and path.stat().st_size:
+                frames.append(pd.read_csv(path))
+        except Exception:
+            continue
+    json_path=data_dir/f"{symbol.lower()}_shares_baseline.json"
+    try:
+        if json_path.exists():
+            payload=json.loads(json_path.read_text(encoding="utf-8"))
+            frames.append(pd.DataFrame(payload.get("records",payload) if isinstance(payload,dict) else payload))
+    except Exception:
+        pass
+    return _normalise_flow_records(pd.concat(frames,ignore_index=True) if frames else pd.DataFrame())
+
+
+def _xlsx_first_sheet(payload: bytes) -> list[list[object]]:
+    """Small dependency-free XLSX reader used for State Street's public SPY workbook."""
+    namespace="{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    with zipfile.ZipFile(BytesIO(payload)) as archive:
+        shared=[]
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root=ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root.findall(f"{namespace}si"):
+                shared.append("".join(node.text or "" for node in item.iter(f"{namespace}t")))
+        sheet_name=next((name for name in archive.namelist() if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")),None)
+        if not sheet_name: return []
+        root=ET.fromstring(archive.read(sheet_name)); rows=[]
+        for row in root.iter(f"{namespace}row"):
+            values=[]
+            for cell in row.findall(f"{namespace}c"):
+                ref=cell.attrib.get("r","A1"); letters="".join(ch for ch in ref if ch.isalpha())
+                column=0
+                for letter in letters: column=column*26+ord(letter.upper())-64
+                while len(values)<column: values.append(None)
+                node=cell.find(f"{namespace}v"); value=node.text if node is not None else None
+                if cell.attrib.get("t")=="s" and value is not None:
+                    try: value=shared[int(value)]
+                    except Exception: pass
+                elif cell.attrib.get("t")=="inlineStr":
+                    value="".join(item.text or "" for item in cell.iter(f"{namespace}t"))
+                values[column-1]=value
+            rows.append(values)
+        return rows
+
+
+def _deep_find_number(obj: object, names: set[str]) -> float:
+    if isinstance(obj,dict):
+        for key,value in obj.items():
+            normal=re.sub(r"[^a-z]","",str(key).lower())
+            if normal in names:
+                try: return float(str(value).replace(",","").replace("$",""))
+                except Exception: pass
+        for value in obj.values():
+            found=_deep_find_number(value,names)
+            if np.isfinite(found): return found
+    elif isinstance(obj,list):
+        for value in obj:
+            found=_deep_find_number(value,names)
+            if np.isfinite(found): return found
+    return np.nan
+
+
+@st.cache_data(ttl=900,show_spinner=False)
+def fetch_issuer_flow_records(symbol: str) -> pd.DataFrame:
+    """Fetch only issuer-published NAV/share observations; no price-volume proxy."""
+    symbol=symbol.upper().strip(); headers={"User-Agent":"Mozilla/5.0 (compatible; BuySideQuantPortal/1.0)"}
+    try:
+        if symbol=="TQQQ":
+            url="https://accounts.profunds.com/etfdata/ByFund/TQQQ-historical_nav.csv"
+            raw=pd.read_csv(StringIO(urlopen(Request(url,headers=headers),timeout=20).read().decode("utf-8-sig",errors="replace")))
+            return _normalise_flow_records(pd.DataFrame({
+                "date":raw.get("Date"),"shares_outstanding":pd.to_numeric(raw.get("Shares Outstanding (000)"),errors="coerce")*1000,
+                "nav":raw.get("NAV"),"source_url":url,"source_note":"ProShares official daily NAV file",
+            }))
+        if symbol=="SPY":
+            url="https://www.ssga.com/library-content/products/fund-data/etfs/us/navhist-us-en-spy.xlsx"
+            rows=_xlsx_first_sheet(urlopen(Request(url,headers=headers),timeout=25).read())
+            header_index=next((i for i,row in enumerate(rows) if row and str(row[0]).strip().lower()=="date"),None)
+            if header_index is None: return pd.DataFrame(columns=FLOW_RECORD_COLUMNS)
+            header=[str(item).strip() if item is not None else "" for item in rows[header_index]]
+            raw=pd.DataFrame(rows[header_index+1:],columns=header)
+            return _normalise_flow_records(pd.DataFrame({
+                "date":raw.get("Date"),"shares_outstanding":raw.get("Shares Outstanding"),"nav":raw.get("NAV"),
+                "source_url":url,"source_note":"State Street official SPY NAV history",
+            }))
+        if symbol=="SOXL":
+            url="https://www.direxion.com/product/daily-semiconductor-bull-bear-3x-etfs"
+            page=urlopen(Request(url,headers=headers),timeout=25).read().decode("utf-8",errors="replace")
+            match=re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',page,re.S|re.I)
+            payload=json.loads(html.unescape(match.group(1))) if match else {}
+            candidates=[]
+            def collect(item: object) -> None:
+                if isinstance(item,dict):
+                    if str(item.get("Ticker",item.get("ticker",""))).upper()=="SOXL": candidates.append(item)
+                    for value in item.values(): collect(value)
+                elif isinstance(item,list):
+                    for value in item: collect(value)
+            collect(payload)
+            fund=candidates[0] if candidates else {}
+            shares=_deep_find_number(fund,{"sharesoutstanding","outstandingshares"})
+            nav=_deep_find_number(fund,{"nav","netassetvalue"})
+            raw_date=str(fund.get("Pricing",{}).get("TradeDate",fund.get("TradeDate",""))) if isinstance(fund,dict) else ""
+            observed=pd.to_datetime(raw_date,format="%m%d%Y",errors="coerce")
+            if np.isfinite(shares) and np.isfinite(nav) and pd.notna(observed):
+                return _normalise_flow_records(pd.DataFrame([{"date":observed,"shares_outstanding":shares,"nav":nav,
+                    "source_url":url,"source_note":"Direxion official product page"}]))
+        if symbol=="QQQ":
+            url=("https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/46090E103/prices"
+                 "?idType=cusip&productType=ETF&variationType=priceListing&productSubType=ETF")
+            api_headers={**headers,"User-Agent":"BuySideQuantPortal/1.0"}
+            payload=json.loads(urlopen(Request(url,headers=api_headers),timeout=25).read().decode("utf-8",errors="replace"))
+            return _normalise_flow_records(pd.DataFrame([{
+                "date":payload.get("effectiveDate"),"shares_outstanding":payload.get("sharesOutstanding"),
+                "nav":payload.get("nav"),"source_url":url,"source_note":"Invesco official QQQ prices API",
+            }]))
+    except Exception:
+        pass
+    return pd.DataFrame(columns=FLOW_RECORD_COLUMNS)
+
+
+def _persist_latest_flow_record(symbol: str, records: pd.DataFrame) -> str:
+    """Atomically append a new issuer observation; cloud ephemeral files fail safely."""
+    if records.empty: return "NO NEW ISSUER SHARE RECORD"
+    path=Path(__file__).resolve().parent/"data"/f"{symbol.lower()}_flow_history.csv"
+    try:
+        path.parent.mkdir(parents=True,exist_ok=True)
+        existing=pd.read_csv(path) if path.exists() and path.stat().st_size else pd.DataFrame(columns=FLOW_RECORD_COLUMNS)
+        combined=_normalise_flow_records(pd.concat([existing,records.tail(1)],ignore_index=True))
+        if not existing.empty and len(combined)==len(_normalise_flow_records(existing)):
+            return "LOCAL LOGGER CURRENT"
+        temporary=path.with_suffix(".csv.tmp")
+        combined.to_csv(temporary,index=False,date_format="%Y-%m-%d")
+        temporary.replace(path)
+        return "LOCAL LOGGER UPDATED"
+    except Exception as exc:
+        return f"LOGGER READ-ONLY / {type(exc).__name__}"
+
+
+@st.cache_data(ttl=900,show_spinner=False)
+def load_primary_flow(symbol: str) -> pd.DataFrame:
+    """Merge verified baselines, issuer updates and price, assigning zero to missing record dates."""
+    symbol=symbol.upper().strip(); end=date.today()+timedelta(days=1); start=end-timedelta(days=550)
+    try:
+        history=yf.Ticker(symbol).history(start=start,end=end,auto_adjust=True)[["Close"]].dropna(subset=["Close"])
+    except Exception:
+        history=pd.DataFrame()
+    if history.empty: return pd.DataFrame()
+    history.index=pd.to_datetime(history.index)
+    if history.index.tz is not None: history.index=history.index.tz_convert(None)
+    history=history.groupby(history.index.normalize()).last().sort_index()
+
+    baseline=_read_baseline_records(symbol); live=fetch_issuer_flow_records(symbol)
+    logger_status=_persist_latest_flow_record(symbol,live)
+    logged=_read_baseline_records(symbol)
+    records=_normalise_flow_records(pd.concat([baseline,logged,live],ignore_index=True))
+    if not records.empty: records=records.set_index("date")
+
+    data=history.copy(); data["HasOfficialRecord"]=data.index.isin(records.index) if not records.empty else False
+    if records.empty:
+        data["Shares"]=np.nan; data["NAV"]=np.nan; data["DailyFlow"]=0.0
+        data["Source"]="NO VERIFIED ISSUER SHARES DATA"; data["OfficialAsOf"]=pd.NaT
+        data["HasVerifiedShares"]=False; data["LoggerStatus"]=logger_status; data["RecordCount"]=0
+        return data.tail(180)
+
+    data["Shares"]=records["shares_outstanding"].reindex(data.index).ffill()
+    data["NAV"]=records["nav"].reindex(data.index)
+    prior_nav=records["nav"].shift(1)
+    reported_delta=records["shares_outstanding"].diff()
+    # A sparse baseline must never collapse weeks/months of creations into one fake daily spike.
+    adjacent=records.index.to_series().diff().dt.days.le(5)
+    record_flow=(reported_delta*prior_nav).where(adjacent,0.0)
+    data["DailyFlow"]=record_flow.reindex(data.index).where(data["HasOfficialRecord"],0.0).fillna(0.0)
+    data["OfficialAsOf"]=records.index.max(); data["HasVerifiedShares"]=True
+    source_notes=records["source_note"].dropna().astype(str); source_notes=source_notes[source_notes.str.len().gt(0)]
+    data["Source"]=" + ".join(dict.fromkeys(source_notes.tail(4))) or "LOCAL VERIFIED BASELINE"
+    data["LoggerStatus"]=logger_status; data["RecordCount"]=len(records)
+    return data.dropna(subset=["Close"]).tail(180)
+
+
+def sector_rs_scoreboard(price_frame: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ticker,(name,cn_name,_) in SECTORS.items():
+        if ticker not in price_frame: continue
+        pair=price_frame[[ticker,"SPY"]].dropna(); ratio=pair[ticker].div(pair["SPY"])
+        if len(ratio)<200: continue
+        latest=float(ratio.iloc[-1]); ma20=float(ratio.ewm(span=20,adjust=False).mean().iloc[-1])
+        ma50=float(ratio.ewm(span=50,adjust=False).mean().iloc[-1]); ma200=float(ratio.rolling(200).mean().iloc[-1])
+        above20,above50,above200=latest>ma20,latest>ma50,latest>ma200
+        if above20 and above50 and above200: regime="🔥 绝对强势"
+        elif above20 and above50 and not above200: regime="⚡ 超跌反弹"
+        elif not above20 and not above50 and above200: regime="⚠️ 强势回调"
+        elif not above20 and not above50 and not above200: regime="❄️ 弱势破位"
+        else: regime="🔄 均线过渡"
+        rows.append({"Sector":f"{name} · {cn_name}","ETF":ticker,"RS vs 20EMA":(latest/ma20-1)*100,
+                     "RS vs 50EMA":(latest/ma50-1)*100,"RS vs 200SMA":(latest/ma200-1)*100,"Regime 定性":regime})
+    return pd.DataFrame(rows)
+
+
+def rrg_improving_crossovers(price_frame: pd.DataFrame,tickers: list[str],benchmark: str="SPY") -> list[str]:
+    transitions=[]
+    if benchmark not in price_frame: return transitions
+    for ticker in tickers:
+        if ticker not in price_frame: continue
+        frame=rrg_frame(price_frame[ticker],price_frame[benchmark]).tail(4)
+        if len(frame)<4: continue
+        current=frame.iloc[-1]; prior=frame.iloc[:-1]
+        if current["rs_ratio"]<100 and current["rs_momentum"]>100 and ((prior["rs_ratio"]<100)&(prior["rs_momentum"]<100)).any():
+            transitions.append(ticker)
+    return transitions
+
+
+def circuit_breaker_state(price_frame: pd.DataFrame) -> dict[str,object]:
+    broken=[]
+    for ticker in ("SPY","QQQ"):
+        s=price_frame[ticker].dropna() if ticker in price_frame else pd.Series(dtype=float)
+        sma=s.rolling(200,min_periods=200).mean()
+        if not sma.dropna().empty and float(s.iloc[-1])<float(sma.iloc[-1]): broken.append(ticker)
+    credit_warning=False; credit_change=np.nan
+    if {"HYG","LQD"}.issubset(price_frame.columns):
+        credit=price_frame[["HYG","LQD"]].dropna(); ratio=credit["HYG"].div(credit["LQD"])
+        if len(ratio)>=50:
+            credit_change=last_return(ratio,20); credit_warning=bool(ratio.iloc[-1]<ratio.rolling(50).mean().iloc[-1] and credit_change<0)
+    vix_ratio=np.nan
+    if {"^VIX","^VIX3M"}.issubset(price_frame.columns):
+        vix_pair=price_frame[["^VIX","^VIX3M"]].dropna()
+        if not vix_pair.empty and vix_pair.iloc[-1,1]>0: vix_ratio=float(vix_pair.iloc[-1,0]/vix_pair.iloc[-1,1])
+    return {"broken":broken,"credit_warning":credit_warning,"credit_change":credit_change,
+            "vix_ratio":vix_ratio,"vix_inverted":bool(np.isfinite(vix_ratio) and vix_ratio>=1)}
 
 
 def last_return(series: pd.Series, periods: int) -> float:
@@ -664,15 +1259,243 @@ def mover_frame(price_frame: pd.DataFrame, universe: dict[str, tuple]) -> pd.Dat
     return pd.DataFrame(rows)
 
 
+def _secret(name: str, fallback: str = "") -> str:
+    """Read an optional Streamlit secret without requiring a local secrets.toml."""
+    try:
+        return str(st.secrets.get(name,fallback))
+    except Exception:
+        return fallback
+
+
+def send_webhook_notification(channel: str, message: str, webhook_url: str = "",
+                              bot_token: str = "", chat_id: str = "") -> tuple[bool,str]:
+    """Send one short notification; credentials never enter cache or disk."""
+    try:
+        if channel == "Telegram Bot":
+            if not bot_token.strip() or not chat_id.strip():
+                return False,"请填写 Bot Token 与 Chat ID。"
+            endpoint=f"https://api.telegram.org/bot{bot_token.strip()}/sendMessage"
+            response=requests.post(endpoint,json={"chat_id":chat_id.strip(),"text":message,
+                "parse_mode":"Markdown","disable_web_page_preview":True},timeout=3)
+        elif channel == "Discord Webhook":
+            if not webhook_url.strip(): return False,"请填写 Webhook URL。"
+            response=requests.post(webhook_url.strip(),json={"username":"Buy-Side Quant Portal",
+                "embeds":[{"title":"◈ QUANT ALERT CENTER","description":message,"color":15158332,
+                           "footer":{"text":"Automated research signal · Not investment advice"}}]},timeout=3)
+        else:
+            if not webhook_url.strip(): return False,"请填写 Webhook URL。"
+            url=webhook_url.strip()
+            if "open.feishu.cn" in url or "larksuite.com" in url:
+                payload={"msg_type":"text","content":{"text":message}}
+            else:
+                payload={"text":message,"content":message,"message":message}
+            response=requests.post(url,json=payload,timeout=3)
+        response.raise_for_status()
+        return True,f"HTTP {response.status_code} · 推送成功"
+    except requests.RequestException as exc:
+        status=getattr(getattr(exc,"response",None),"status_code",None)
+        return False,f"推送失败"+(f"（HTTP {status}）" if status else "（网络超时或地址不可达）")
+    except Exception:
+        return False,"推送失败（配置格式无效）"
+
+
+def evaluate_market_alerts(breaker_state: dict[str,object], flows: dict[str,pd.DataFrame],
+                           skews: dict[str,float], option_data: dict[str,tuple[pd.DataFrame,float]],
+                           improving_names: list[str], asof: object) -> list[dict[str,object]]:
+    """Central, deterministic alert matrix used by the briefing and webhook dispatcher."""
+    alerts=[]; asof_text=str(pd.Timestamp(asof).date()) if pd.notna(asof) else str(date.today())
+    def add(level: int, category: str, message: str) -> None:
+        identity=f"{asof_text}|{level}|{category}|{message}"
+        alerts.append({"ID":hashlib.sha256(identity.encode("utf-8")).hexdigest()[:18],
+            "Level":level,"Severity":{1:"🚨 L1 · CIRCUIT BREAKER",2:"🔥 L2 · HIGH CONVICTION",3:"⚡ L3 · TACTICAL"}[level],
+            "Category":category,"Message":message,"As Of":asof_text})
+    broken=list(breaker_state.get("broken",[]) or [])
+    if broken: add(1,"200 SMA TREND LOCK",f"{', '.join(broken)} 跌破 200SMA；杠杆多头配置进入风控锁定。")
+    if bool(breaker_state.get("vix_inverted",False)):
+        ratio=float(breaker_state.get("vix_ratio",np.nan)); add(1,"VIX TERM INVERSION",f"VIX/VIX3M = {ratio:.3f}，波动率期限结构倒挂。")
+    for symbol,frame in flows.items():
+        if frame.empty or "DailyFlow" not in frame: continue
+        last=frame.iloc[-1]; value=float(last.get("DailyFlow",np.nan)); verified=bool(last.get("HasVerifiedShares",False))
+        official=bool(last.get("HasOfficialRecord",False))
+        if verified and official and np.isfinite(value) and value>=500_000_000:
+            add(2,"PRIMARY ETF FLOW",f"{symbol} 官方份额对应单日净申购 ${value/1e6:,.0f}M，突破 $500M。")
+    for symbol,value in skews.items():
+        if np.isfinite(value) and value>=.95: add(2,"OPTION IV SKEW",f"{symbol} Call/Put IV Skew = {value:.2f}，达到潜在 Gamma 挤压阈值。")
+    tactical=[]
+    for symbol,(chain,spot) in option_data.items():
+        if chain.empty or not np.isfinite(spot): continue
+        frame=chain.copy()
+        for field in ("volume","openInterest","lastPrice","bid","ask","strike"):
+            frame[field]=pd.to_numeric(frame.get(field,np.nan),errors="coerce")
+        frame["ratio"]=frame["volume"].div(frame["openInterest"].replace(0,np.nan))
+        frame["premium"]=frame["volume"].mul(frame["lastPrice"].fillna((frame["bid"]+frame["ask"])/2)).mul(100)
+        frame=frame[(frame["strike"].sub(spot).abs().div(spot)<=.20)&(frame["ratio"]>=2.5)&
+                    (frame["volume"]>=1000)&(frame["premium"]>=5_000_000)]
+        if not frame.empty:
+            top=frame.sort_values("premium",ascending=False).iloc[0]
+            tactical.append(f"{symbol} {top.get('Type','Option')} {top['strike']:g} · Vol/OI {top['ratio']:.1f} · ${top['premium']/1e6:.1f}M")
+    if tactical: add(3,"OPTIONS UOA","；".join(tactical[:5]))
+    if improving_names: add(3,"RRG ROTATION",f"{', '.join(improving_names[:8])} 最近 3 日由 Lagging 扎入 Improving。")
+    return alerts
+
+
+STATIC_XRAY_HOLDINGS={
+    "QQQ":[("NVDA","NVIDIA",8.8),("AAPL","Apple",8.1),("MSFT","Microsoft",7.4),("AVGO","Broadcom",5.0),
+           ("AMZN","Amazon",5.3),("META","Meta",4.0),("GOOGL","Alphabet A",3.0),("GOOG","Alphabet C",2.8),
+           ("TSLA","Tesla",3.3),("COST","Costco",1.2)],
+    "SOXX":[("NVDA","NVIDIA",8.5),("AVGO","Broadcom",8.2),("AMD","AMD",7.3),("MU","Micron",6.5),
+            ("LRCX","Lam Research",6.0),("KLAC","KLA",5.5),("AMAT","Applied Materials",5.3),("TSM","TSMC",4.3),
+            ("ASML","ASML",4.0),("TXN","Texas Instruments",4.0)],
+}
+
+
+def _holdings_from_records(records: object) -> pd.DataFrame:
+    candidates=[]
+    def walk(node: object) -> None:
+        if isinstance(node,list):
+            if node and all(isinstance(item,dict) for item in node): candidates.append(node)
+            for item in node: walk(item)
+        elif isinstance(node,dict):
+            for value in node.values(): walk(value)
+    walk(records)
+    rows=[]
+    for candidate in candidates:
+        for item in candidate:
+            normal={re.sub(r"[^a-z]","",str(k).lower()):v for k,v in item.items()}
+            ticker=next((normal[k] for k in normal if k in {"ticker","symbol","holdingticker"}),None)
+            weight=next((normal[k] for k in normal if k in {"weight","weighting","weightpercent","percentofnetassets","percenttna"}),None)
+            name=next((normal[k] for k in normal if k in {"name","company","holdingname","securityname"}),ticker)
+            try: value=float(str(weight).replace("%","").replace(",",""))
+            except Exception: continue
+            if ticker and np.isfinite(value) and value>0: rows.append((str(ticker).strip(),str(name or ticker).strip(),value))
+        if len(rows)>=5: break
+    return pd.DataFrame(rows,columns=["Ticker","Name","Weight"])
+
+
+@st.cache_data(ttl=3600,show_spinner=False)
+def load_etf_holdings(fund: str) -> tuple[pd.DataFrame,str]:
+    """Issuer-first top holdings with an explicit dated visual baseline fallback."""
+    try:
+        if fund=="QQQ":
+            url="https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/46090E103/holdings/fund?idType=cusip&productType=ETF"
+            response=requests.get(url,headers={"User-Agent":"Mozilla/5.0"},timeout=10); response.raise_for_status()
+            frame=_holdings_from_records(response.json())
+            source="Invesco official holdings API"
+        else:
+            url="https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf/1467271812596.ajax?fileType=csv&fileName=SOXX_holdings&dataType=fund"
+            response=requests.get(url,headers={"User-Agent":"Mozilla/5.0"},timeout=10); response.raise_for_status()
+            text=response.content.decode("utf-8-sig",errors="ignore"); lines=text.splitlines()
+            start=next(i for i,line in enumerate(lines) if line.startswith("Ticker,"))
+            raw=pd.read_csv(StringIO("\n".join(lines[start:])))
+            weight_col=next(c for c in raw if "Weight" in str(c)); name_col=next(c for c in raw if str(c).strip()=="Name")
+            frame=raw.rename(columns={"Ticker":"Ticker",name_col:"Name",weight_col:"Weight"})[["Ticker","Name","Weight"]]
+            frame["Weight"]=pd.to_numeric(frame["Weight"],errors="coerce")
+            frame=frame[frame["Ticker"].astype(str).str.fullmatch(r"[A-Z][A-Z0-9.\-]*",na=False)]
+            source="iShares official SOXX holdings CSV"
+        frame=frame.dropna(subset=["Ticker","Weight"]).sort_values("Weight",ascending=False).head(20)
+        if len(frame)<5: raise ValueError("issuer payload did not contain holdings")
+        return frame.reset_index(drop=True),source
+    except Exception:
+        fallback=pd.DataFrame(STATIC_XRAY_HOLDINGS[fund],columns=["Ticker","Name","Weight"])
+        return fallback,f"Built-in reference baseline ({fund}; issuer endpoint unavailable)"
+
+
+@st.cache_data(ttl=3600,show_spinner=False)
+def load_fred_series(series_ids: tuple[str,...]) -> tuple[pd.DataFrame,dict[str,str]]:
+    """Merge current official observations with a dated, bundled offline snapshot."""
+    headers={
+        "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,text/csv,*/*;q=0.8",
+    }
+    snapshot_path=Path(__file__).resolve().parent/"data"/"fred_offline_snapshot.csv"
+    try:
+        snapshot=pd.read_csv(snapshot_path,index_col="DATE",parse_dates=["DATE"])
+        snapshot=snapshot.apply(pd.to_numeric,errors="coerce").sort_index()
+        snapshot=snapshot[~snapshot.index.isna()]
+    except (OSError,ValueError,pd.errors.ParserError):
+        snapshot=pd.DataFrame()
+
+    def fetch_one(series_id: str) -> pd.Series:
+        # OFR FSI is published by the Office of Financial Research, not as FRED's OFRFSI ID.
+        url=("https://www.financialresearch.gov/financial-stress-index/data/fsi.csv"
+             if series_id=="OFRFSI" else
+             f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}")
+        response=requests.get(url,headers=headers,timeout=10)
+        response.raise_for_status()
+        raw=pd.read_csv(StringIO(response.text))
+        date_col="Date" if series_id=="OFRFSI" else raw.columns[0]
+        value_col="OFR FSI" if series_id=="OFRFSI" else series_id
+        if date_col not in raw or value_col not in raw:
+            raise ValueError(f"unexpected CSV columns for {series_id}")
+        dates=pd.to_datetime(raw[date_col],errors="coerce")
+        values=pd.to_numeric(raw[value_col],errors="coerce")
+        item=pd.Series(values.to_numpy(),index=dates,name=series_id).dropna()
+        item=item[~item.index.isna()]
+        if item.empty:
+            raise ValueError(f"no numeric observations for {series_id}")
+        return item[~item.index.duplicated(keep="last")].sort_index()
+
+    live={}
+    # A failed FRED endpoint should cost at most one timeout window, not eight in series.
+    with ThreadPoolExecutor(max_workers=min(6,len(series_ids) or 1)) as pool:
+        futures={pool.submit(fetch_one,series_id):series_id for series_id in series_ids}
+        for future in as_completed(futures):
+            try:
+                live[futures[future]]=future.result()
+            except Exception:
+                # One malformed or blocked source must never prevent the other series rendering.
+                pass
+    combined={}; status={}
+    for series_id in series_ids:
+        offline=(snapshot[series_id].dropna() if series_id in snapshot else pd.Series(dtype=float))
+        if series_id in live:
+            combined[series_id]=live[series_id].combine_first(offline)
+            status[series_id]="live"
+        elif not offline.empty:
+            combined[series_id]=offline
+            status[series_id]="offline"
+        else:
+            status[series_id]="unavailable"
+    frame=pd.concat(combined,axis=1).sort_index() if combined else pd.DataFrame()
+    return frame,status
+
+
+def inflation_release_table(fred: pd.DataFrame) -> pd.DataFrame:
+    monthly=fred.resample("ME").last() if not fred.empty else pd.DataFrame()
+    result=pd.DataFrame(index=monthly.index)
+    if "PCEPI" in monthly: result["Headline PCE · YoY"]=monthly["PCEPI"].pct_change(12,fill_method=None)*100
+    if "PCEPILFE" in monthly: result["Core PCE · YoY"]=monthly["PCEPILFE"].pct_change(12,fill_method=None)*100
+    if "PCETRIM1M158SFRBDAL" in monthly:
+        one=monthly["PCETRIM1M158SFRBDAL"]
+        result["Trimmed Mean PCE · 1M ann."]=one
+        result["Trimmed Mean PCE · 6M ann."]=(one.div(100).add(1).pow(1/12).rolling(6).apply(np.prod,raw=True).pow(2)-1)*100
+    if "PCETRIM12M159SFRBDAL" in monthly: result["Trimmed Mean PCE · 12M"]=monthly["PCETRIM12M159SFRBDAL"]
+    if "PI" in monthly: result["Personal Income · MoM"]=monthly["PI"].pct_change(fill_method=None)*100
+    if "PCE" in monthly: result["Personal Spending · MoM"]=monthly["PCE"].pct_change(fill_method=None)*100
+    result=result.dropna(how="all").tail(12).T
+    result.columns=[stamp.strftime("%Y-%m") for stamp in result.columns]
+    return result
+
+
+def heat_style_table(frame: pd.DataFrame) -> pd.io.formats.style.Styler:
+    def row_colors(row: pd.Series) -> list[str]:
+        values=pd.to_numeric(row,errors="coerce"); finite=values[np.isfinite(values)]
+        if finite.empty: return ["color:#718198" for _ in row]
+        low,high=float(finite.min()),float(finite.max()); span=max(high-low,1e-9)
+        styles=[]
+        for value in values:
+            if not np.isfinite(value): styles.append("color:#718198;background:#0b121d"); continue
+            position=(float(value)-low)/span
+            if position>.66: styles.append("color:#ffd6dc;background:rgba(151,35,57,.55);font-weight:700")
+            elif position<.34: styles.append("color:#c9ffe9;background:rgba(20,112,82,.48);font-weight:700")
+            else: styles.append("color:#d7e0ec;background:#101823")
+        return styles
+    return frame.style.format("{:.2f}",na_rep="—").apply(row_colors,axis=1)
+
+
 def base_layout(fig: go.Figure, height: int, hovermode: str = "closest") -> go.Figure:
-    fig.update_layout(template="plotly_dark", height=height, paper_bgcolor=PAPER, plot_bgcolor=PLOT,
-        margin=dict(l=48, r=18, t=34, b=42), hovermode=hovermode,
-        font=dict(family="Inter, Segoe UI, sans-serif", size=11, color="#b8c5d6"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0, font=dict(size=9), bgcolor="rgba(0,0,0,0)"),
-        hoverlabel=dict(bgcolor="#101b2b", bordercolor="#2a405e", font_color="#edf4ff"))
-    fig.update_xaxes(gridcolor=GRID, linecolor="#25354b", zeroline=False)
-    fig.update_yaxes(gridcolor=GRID, linecolor="#25354b", zeroline=False)
-    return fig
+    current_theme = st.session_state.get("portal_theme_choice", "Bloomberg Pro (买方经典)")
+    return apply_quant_theme(fig, height, hovermode, theme_name=current_theme)
 
 
 def section_header(kicker: str, title: str, note: str) -> None:
@@ -690,16 +1513,34 @@ def format_num(value: float, suffix: str = "%") -> str:
 
 with st.sidebar:
     st.markdown("### ◈ QUANT CONTROLS")
-    st.caption("显示参数 · 数据每小时缓存")
-    tail_length = st.slider("RRG Tail · 尾迹交易日", 5, 10, 7)
+    st.caption("研究数据缓存 15 分钟 · 顶部行情独立缓存 45 秒")
+    live_pulse_auto_refresh=st.toggle("顶部实时盘面 · 60s 局部刷新",value=True,
+        help="仅重跑 Global Market Pulse Fragment，不触发 RRG、期权链与宏观数据重新下载。")
+    tail_length = st.slider("RRG Tail · 尾迹交易日", 5, 10, 5)
     rs_horizon = st.select_slider("RS Horizon · 观察期", options=list(PERIOD_BARS), value="1Y")
     z_window = st.slider("Z-Score Window", 60, 250, 120, 5)
+    with st.expander("🔔 预警推送配置 (Alert Settings)",expanded=False):
+        alert_channel=st.selectbox("Webhook 类型",["Discord Webhook","Telegram Bot","通用 Webhook (LINE/飞书/Server酱)"],key="alert_channel")
+        alert_webhook_url=""; alert_bot_token=""; alert_chat_id=""
+        if alert_channel=="Telegram Bot":
+            alert_bot_token=st.text_input("Bot Token",value=_secret("TELEGRAM_BOT_TOKEN"),type="password",key="alert_bot_token")
+            alert_chat_id=st.text_input("Chat ID",value=_secret("TELEGRAM_CHAT_ID"),key="alert_chat_id")
+        else:
+            alert_webhook_url=st.text_input("Webhook URL",value=_secret("ALERT_WEBHOOK_URL"),type="password",key="alert_webhook_url")
+        alert_auto_send=st.toggle("自动推送 L1 / L2",value=False,key="alert_auto_send",
+            help="只发送此前未成功推送过的当日警报；浏览器会话内自动去重。")
+        if st.button("📨 发送测试通知 (Test Ping)",use_container_width=True):
+            test_message="**TEST PING · 连接验证**\nBuy-Side Quant Portal 预警通道已连通。\n`Research only · Not investment advice`"
+            ok,note=send_webhook_notification(alert_channel,test_message,alert_webhook_url,alert_bot_token,alert_chat_id)
+            (st.success if ok else st.error)(note)
     st.divider()
-    st.caption("RRG / RS 基准：SPY\n\nDrawdown：近 2 年峰值\n\nAdv / Dec：核心权重股样本")
+    st.caption("Tab 01 RRG / RS 基准：QQQ / SPY 可切换\n\nDrawdown：近 2 年峰值\n\nAdv / Dec：核心权重股样本")
 
-core_tickers = ["SPY", "QQQ", "IWM", "^GSPC", "^NDX", "^VIX", "HYG", "LQD"]
+core_tickers = ["SPY", "QQQ", "IWM", "^GSPC", "^NDX", "^VIX", "^VIX3M", "HYG", "LQD"]
+theme_tickers=[ticker for members in AI_THEMES.values() for ticker in members]
 all_tickers = tuple(dict.fromkeys(core_tickers + list(SECTORS) + list(RRG_EXTRA) + list(COMMODITIES)
-                                  + list(HEAT_UNIVERSE) + list(NASDAQ_UNIVERSE) + list(YIELD_TICKERS.values())))
+                                  + list(HEAT_UNIVERSE) + list(NASDAQ_UNIVERSE) + list(YIELD_TICKERS.values())
+                                  + theme_tickers + list(OPTION_POOL) + list(PRIMARY_FLOW_ETFS)))
 end_date, start_date = date.today() + timedelta(days=1), date.today() - timedelta(days=2300)
 try:
     with st.spinner("SYNCING MARKET DATA / 正在同步市场数据…"):
@@ -736,47 +1577,194 @@ try:
 except Exception:
     sector_flow_close,sector_flow_volume=pd.DataFrame(),pd.DataFrame()
 
-st.markdown(f"""<div class="portal-head"><div><div class="portal-title">BUY-SIDE QUANT PORTAL</div>
-<div class="portal-sub">CROSS-ASSET INTELLIGENCE · ROTATION · BREADTH · REGIME</div></div>
-<div class="live">DATA AS OF {latest_date:%Y-%m-%d}</div></div><div class="deck-label">Global Market Pulse / 大盘核心指标</div>""", unsafe_allow_html=True)
+breakers=circuit_breaker_state(prices)
 
-deck = st.columns(7)
-for idx, ticker in enumerate(["SPY", "QQQ", "IWM"]):
-    s = prices[ticker].dropna() if ticker in prices else pd.Series(dtype=float)
-    latest = float(s.iloc[-1]) if not s.empty else np.nan
-    deck[idx].metric(ticker, "N/A" if not np.isfinite(latest) else f"${latest:,.2f}", format_num(last_return(s, 1)), help="调整后收盘价及最近交易日涨跌幅")
-spx_dd = drawdown_from_high(prices["^GSPC"].dropna().tail(504)) if "^GSPC" in prices else np.nan
-ndx_dd = drawdown_from_high(prices["^NDX"].dropna().tail(504)) if "^NDX" in prices else np.nan
-deck[3].metric("SPX DRAWDOWN", format_num(spx_dd), "FROM 2Y HIGH", delta_color="off", help="相对近两年最高收盘价")
-deck[4].metric("NDX DRAWDOWN", format_num(ndx_dd), "FROM 2Y HIGH", delta_color="off", help="相对近两年最高收盘价")
-sp_breadth_text = "N/A" if sp_missing == 500 else f"{sp_adv}/{sp_dec}/{sp_unch}/{sp_missing}"
-deck[5].metric("SPY 500 · A/D/U/M",sp_breadth_text,"SUM = 500",delta_color="off",
-               help="500家公司口径：上涨 / 下跌 / 平盘 / 缺失；四项合计恒为500")
-ndx_returns=pd.Series({t:last_return(prices[t],1) for t in NASDAQ_UNIVERSE if t in prices}).dropna()
-ndx_adv,ndx_dec,ndx_unch=int((ndx_returns>0).sum()),int((ndx_returns<0).sum()),int((ndx_returns==0).sum())
-deck[6].metric("NDX SAMPLE · A / D / U",f"{ndx_adv} / {ndx_dec} / {ndx_unch}",
-               f"{len(NASDAQ_UNIVERSE)-len(ndx_returns)} MISSING",delta_color="off",help="Nasdaq-100 看板覆盖样本；不显示涨跌比率")
+
+@st.fragment(run_every="60s" if live_pulse_auto_refresh else None)
+def render_live_market_pulse() -> None:
+    """Refresh only the header tape; heavy research modules stay outside this fragment."""
+    session=us_market_status(); eastern=pytz.timezone("US/Eastern")
+    refreshed_at=datetime.now(eastern)
+    try:
+        pulse=fetch_live_pulse()
+    except Exception:
+        pulse=pd.DataFrame()
+    quote_stamps=[]
+    if not pulse.empty and "QuoteTimeET" in pulse:
+        quote_stamps=[stamp for stamp in pulse["QuoteTimeET"].tolist() if pd.notna(stamp)]
+    quote_asof=max(quote_stamps).strftime("%H:%M:%S ET") if quote_stamps else "DAILY FALLBACK"
+    st.markdown(f"""<div class="portal-head"><div><div class="portal-title">BUY-SIDE QUANT PORTAL</div>
+    <div class="portal-sub">CROSS-ASSET INTELLIGENCE · ROTATION · OPTIONS · PRIMARY FLOW · SYSTEM RISK</div></div>
+    <div class="market-clock"><span style="color:{session['color']}">{session['label']}</span><small>{session['time']} · {session['countdown']}</small></div>
+    <div class="live">LAST UPDATED {refreshed_at:%H:%M:%S} ET<br><span style="color:#71849a">QUOTE {quote_asof}</span></div></div>
+    <div class="deck-label">Global Market Pulse / 实时盘面 · 60s Fragment · 45s Quote Cache</div>""",unsafe_allow_html=True)
+
+    deck=st.columns(8)
+    for idx,(display_ticker,source_ticker) in enumerate((("SPY","SPY"),("QQQ","QQQ"),("IWM","IWM"),("VIX","^VIX"))):
+        live_price=live_change=np.nan
+        if not pulse.empty and display_ticker in pulse.index:
+            live_price=float(pulse.loc[display_ticker,"Price"]); live_change=float(pulse.loc[display_ticker,"ChangePct"])
+        if not np.isfinite(live_price):
+            fallback=prices[source_ticker].dropna() if source_ticker in prices else pd.Series(dtype=float)
+            live_price=float(fallback.iloc[-1]) if not fallback.empty else np.nan; live_change=last_return(fallback,1)
+        value="N/A" if not np.isfinite(live_price) else (f"{live_price:,.2f}" if display_ticker=="VIX" else f"${live_price:,.2f}")
+        deck[idx].metric(display_ticker,value,format_num(live_change),delta_color="inverse" if display_ticker=="VIX" else "normal",
+            help="1分钟行情优先；不可用时回退至最近日线。VIX 上涨使用反向风险配色。")
+
+    spx_dd=drawdown_from_high(prices["^GSPC"].dropna().tail(504)) if "^GSPC" in prices else np.nan
+    ndx_dd=drawdown_from_high(prices["^NDX"].dropna().tail(504)) if "^NDX" in prices else np.nan
+    deck[4].metric("SPX DRAWDOWN",format_num(spx_dd),"FROM 2Y HIGH",delta_color="off",help="15分钟研究缓存：相对近两年最高收盘价")
+    deck[5].metric("NDX DRAWDOWN",format_num(ndx_dd),"FROM 2Y HIGH",delta_color="off",help="15分钟研究缓存：相对近两年最高收盘价")
+    sp_breadth_text="N/A" if sp_missing==500 else f"{sp_adv}/{sp_dec}/{sp_unch}/{sp_missing}"
+    deck[6].metric("SPY 500 · A/D/U/M",sp_breadth_text,"SUM = 500",delta_color="off",
+        help="500家公司日线口径：上涨 / 下跌 / 平盘 / 缺失；四项合计恒为500")
+    ndx_returns=pd.Series({ticker:last_return(prices[ticker],1) for ticker in NASDAQ_UNIVERSE if ticker in prices}).dropna()
+    ndx_adv,ndx_dec,ndx_unch=int((ndx_returns>0).sum()),int((ndx_returns<0).sum()),int((ndx_returns==0).sum())
+    deck[7].metric("NDX SAMPLE · A / D / U",f"{ndx_adv} / {ndx_dec} / {ndx_unch}",
+        f"{len(NASDAQ_UNIVERSE)-len(ndx_returns)} MISSING",delta_color="off",help="Nasdaq-100 看板覆盖样本；不显示涨跌比率")
+
+
+render_live_market_pulse()
+
+if breakers["broken"]:
+    st.markdown(f'<div class="risk-lock">🚨 战略风控锁死：{", ".join(breakers["broken"])} 跌破 200SMA，杠杆多头（TQQQ / SOXL）配置权限关闭</div>',unsafe_allow_html=True)
+
 if missing_tickers:
     st.caption(f"⚠ 本次自动跳过无有效行情的标的：{', '.join(missing_tickers)}")
 
-tab_rotation, tab_market, tab_heat, tab_macro, tab_technical, tab_pattern, tab_fixed, tab_pulse = st.tabs([
-    "01  SECTOR ROTATION · 行业轮动", "02  MARKETS & BREADTH · 大盘表现与广度",
+tab_briefing,tab_rotation,tab_market,tab_heat,tab_macro,tab_technical,tab_pattern,tab_options,tab_flow,tab_circuit,tab_fixed,tab_xray,tab_deep,tab_pulse = st.tabs([
+    "00  BRIEFING · 每日情报", "01  SECTOR & AI THEMES RRG · 轮动",
+    "02  MARKETS & BREADTH · 大盘表现与广度",
     "03  HEAT MAPS · 板块热力图", "04  MACRO & COMMODITIES · 宏观与大宗",
-    "05  TECHNICALS · 相对强度", "06  REGIME & PATTERN · 状态形态", "07  FIXED INCOME · 固定收益", "08  EVENT PULSE · 新闻数据",
+    "05  TECHNICALS · 相对强度", "06  REGIME & PATTERN · 状态形态",
+    "07  OPTIONS UOA & GAMMA · 期权", "08  PRIMARY ETF FLOW · 一级市场",
+    "09  CIRCUIT BREAKERS · 系统风控", "10  FIXED INCOME · 固定收益",
+    "11  ETF X-RAY · 穿透敞口", "12  MACRO DEEP DIVE · FRED", "13  EVENT PULSE · 新闻数据",
 ])
 
+with tab_briefing:
+    section_header("DAILY COMMAND CENTER","00 Briefing · 每日情报总控台","多维共振摘要；Yahoo 数据缺失时相应信号自动降级，不阻塞其他模块。")
+    flow_snapshots={}
+    # Briefing needs only the two leveraged products; QQQ/SPY are fetched lazily
+    # when selected in Tab 08 so their issuer workbooks do not slow every rerun.
+    for symbol in LEVERAGED_ETFS:
+        try: flow_snapshots[symbol]=load_primary_flow(symbol)
+        except Exception: flow_snapshots[symbol]=pd.DataFrame()
+    option_snapshots={}
+    for symbol in OPTION_POOL:
+        try: option_snapshots[symbol]=load_option_snapshot(symbol,1)
+        except Exception: option_snapshots[symbol]=(pd.DataFrame(),np.nan)
+    latest_flows={symbol:(float(frame["DailyFlow"].dropna().iloc[-1]) if not frame.empty and not frame["DailyFlow"].dropna().empty else np.nan)
+                  for symbol,frame in flow_snapshots.items()}
+    flow_verified={symbol:(bool(frame["HasVerifiedShares"].iloc[-1]) if not frame.empty and "HasVerifiedShares" in frame else False)
+                   for symbol,frame in flow_snapshots.items()}
+    extreme_flow=[s for s in LEVERAGED_ETFS if np.isfinite(latest_flows.get(s,np.nan))
+                  and latest_flows[s]>=500_000_000 and flow_verified.get(s,False)]
+    skew_values={}
+    for symbol in ("QQQ","SPY"):
+        chain,spot=option_snapshots.get(symbol,(pd.DataFrame(),np.nan)); skew_values[symbol]=option_skew_proxy(chain,spot)[0]
+    skew_alert=[s for s,v in skew_values.items() if np.isfinite(v) and v>=.95]
+    rotation_universe=list(dict.fromkeys(list(SECTORS)+theme_tickers))
+    improving=rrg_improving_crossovers(prices,rotation_universe)
+    firewall_safe=not breakers["broken"] and not breakers["credit_warning"] and not breakers["vix_inverted"]
+    alert_cards=st.columns(4)
+    unavailable_flows=[symbol for symbol in LEVERAGED_ETFS if not flow_verified.get(symbol,False)]
+    alert_cards[0].metric("🚨 杠杆 ETF 一级市场", "🔥 机构级抄底流入确认" if extreme_flow else "OFFICIAL FLOW WATCH",
+        "、".join(f"{s} ${latest_flows[s]/1e6:,.0f}M" for s in extreme_flow) if extreme_flow else
+        (f"待补官方份额：{'、'.join(unavailable_flows)}" if unavailable_flows else "TQQQ / SOXL · $500M 阈值"),delta_color="off")
+    alert_cards[1].metric("⚡ Gamma 挤压 & 偏度", "⚡ 偏度严重倒挂 / 潜在轧空" if skew_alert else "SKEW NORMAL",
+        " · ".join(f"{s} {skew_values[s]:.2f}" for s in skew_values if np.isfinite(skew_values[s])) or "期权链暂不可用",delta_color="off")
+    alert_cards[2].metric("🎯 RRG 弱转强", "、".join(improving[:5]) if improving else "暂无确认",
+        "近3日 Lagging → Improving",delta_color="off")
+    alert_cards[3].metric("🛡️ 地缘与宏观防火墙", "🟢 战略环境安全" if firewall_safe else "🚨 触发风控熔断",
+        f"200SMA {len(breakers['broken'])} · Credit {'RISK' if breakers['credit_warning'] else 'OK'} · VIX {'INV' if breakers['vix_inverted'] else 'OK'}",delta_color="off")
+
+    uoa_reports=[]
+    for symbol,(chain,spot) in option_snapshots.items():
+        unusual=unusual_option_rows(chain,spot,2.0,1000,.20).head(3)
+        if unusual.empty: continue
+        unusual.insert(0,"Symbol",symbol); uoa_reports.append(unusual)
+    uoa_report=pd.concat(uoa_reports,ignore_index=True) if uoa_reports else pd.DataFrame()
+    ai_momentum=[]
+    for theme,members in AI_THEMES.items():
+        if theme.startswith("宏观"): continue
+        returns={ticker:last_return(prices[ticker],5) for ticker in members if ticker in prices}
+        valid={ticker:value for ticker,value in returns.items() if np.isfinite(value)}
+        if valid:
+            leader=max(valid,key=valid.get); ai_momentum.append((theme,float(np.mean(list(valid.values()))),leader,valid[leader]))
+    ai_momentum.sort(key=lambda item:item[1],reverse=True)
+    section_header("QUANT DIAGNOSTIC","今日量化诊断清单","异常期权为监控池扫描；Volume/OI 无法单独确认主动买卖或开平仓方向。")
+    uoa_text="；".join(f"{row['Symbol']} {row['Type']} {row['Strike']:g} · Vol/OI {row['Vol/OI']:.1f}" for _,row in uoa_report.head(5).iterrows()) if not uoa_report.empty else "监控池内暂无 Vol > 2×OI 且成交量≥1000 的近月虚值合约"
+    ai_text="；".join(f"{theme.replace('AI · ','')}：{leader} {leader_ret:+.1f}%（主题5日均值 {avg:+.1f}%）" for theme,avg,leader,leader_ret in ai_momentum[:3]) or "AI 主题数据不足"
+    st.markdown(f"""
+- **期权异常榜：** {uoa_text}
+- **AI 动能榜：** {ai_text}
+- **系统风控：** 指数破位 `{', '.join(breakers['broken']) or '无'}`；信用流动性 `{'收紧' if breakers['credit_warning'] else '正常'}`；VIX期限结构 `{'倒挂' if breakers['vix_inverted'] else '正向'}`。
+- **执行纪律：** 只有趋势、广度、期权与一级市场资金流形成共振时才升级信号等级；单一代理指标不构成交易指令。
+""")
+
+    active_alerts=evaluate_market_alerts(breakers,flow_snapshots,skew_values,option_snapshots,improving,latest_date)
+    existing_log=st.session_state.setdefault("_active_alert_log",[])
+    known_ids={item.get("ID") for item in existing_log}
+    for item in active_alerts:
+        if item["ID"] not in known_ids:
+            existing_log.insert(0,{**item,"Unread":True})
+    st.session_state["_active_alert_log"]=existing_log[:100]
+
+    if alert_auto_send:
+        priority=[item for item in active_alerts if int(item["Level"])<=2]
+        sent_ids=set(st.session_state.get("_sent_alert_ids",[])); pending=[item for item in priority if item["ID"] not in sent_ids]
+        if pending:
+            body="**BUY-SIDE QUANT PORTAL · ACTIVE ALERTS**\n"+"\n".join(
+                f"{item['Severity']} | **{item['Category']}**\n{item['Message']}" for item in pending)
+            ok,note=send_webhook_notification(alert_channel,body,alert_webhook_url,alert_bot_token,alert_chat_id)
+            if ok:
+                sent_ids.update(item["ID"] for item in pending); st.session_state["_sent_alert_ids"]=list(sent_ids)[-200:]
+                st.toast(f"预警已推送 · {len(pending)} 条",icon="🔔")
+            elif alert_webhook_url or (alert_bot_token and alert_chat_id):
+                st.warning(f"自动推送未完成：{note}")
+
+    section_header("ALERT CENTER","今日未读警报日志 · Active Alerts Log","L1/L2 可自动推送；相同数据日与规则触发在当前浏览器会话内只发送一次。")
+    log_frame=pd.DataFrame(st.session_state.get("_active_alert_log",[]))
+    unread_count=int(log_frame["Unread"].sum()) if not log_frame.empty and "Unread" in log_frame else 0
+    log_left,log_right=st.columns([5,1],vertical_alignment="bottom")
+    log_left.caption(f"ACTIVE {len(active_alerts)} · UNREAD {unread_count} · HISTORY {len(log_frame)}")
+    if log_right.button("全部标为已读",use_container_width=True,disabled=unread_count==0):
+        for item in st.session_state.get("_active_alert_log",[]): item["Unread"]=False
+        st.rerun()
+    if log_frame.empty:
+        st.success("🟢 当前规则矩阵没有触发警报。")
+    else:
+        display_log=log_frame[["Unread","Severity","Category","Message","As Of"]].copy()
+        display_log["Unread"]=display_log["Unread"].map({True:"● NEW",False:"READ"})
+        st.dataframe(display_log,use_container_width=True,hide_index=True,height=min(330,72+35*len(display_log)))
+
 with tab_rotation:
+    rotation_head,rotation_control,benchmark_control=st.columns([4.6,1.75,1.0],vertical_alignment="bottom")
+    with rotation_head:
+        section_header("MULTI-ASSET ROTATION","01 Sector & AI Themes RRG · 个股主题下钻","行业、AI 基建与地缘主题的相对旋转、量能和期权战术共振。")
+    with rotation_control:
+        selected_theme=st.selectbox("Theme 观测池",list(AI_THEMES),key="rrg_theme_selector")
+    with benchmark_control:
+        rrg_benchmark=st.selectbox("RRG Benchmark",["QQQ","SPY"],key="rrg_benchmark")
+    selected_rrg_tickers=AI_THEMES[selected_theme]
+    theme_crossovers=rrg_improving_crossovers(prices,selected_rrg_tickers,rrg_benchmark)
+    if theme_crossovers:
+        st.success(f"🎯 弱转强自动诊断：{'、'.join(theme_crossovers)} 最近3日由 Lagging 跨入 Improving。")
+    else:
+        st.info("弱转强自动诊断：当前主题暂无 Lagging → Improving 的三日确认信号。")
     col_left, col_right = st.columns(2, gap="medium")
     with col_left:
-        section_header("RELATIVE ROTATION", "RRG · 行业相对旋转", "13 个行业与核心资产相对 SPY；末端为最新交易日。")
+        section_header("RELATIVE ROTATION", f"RRG · {selected_theme}", f"相对 {rrg_benchmark}；末端为最新交易日，尾迹长度由侧边栏控制。")
         fig, tails = go.Figure(), []
-        rrg_names = {**{k: v[1] for k, v in SECTORS.items()}, **RRG_EXTRA}
+        rrg_names = {ticker:(SECTORS[ticker][1] if ticker in SECTORS else TACTICAL_NAMES.get(ticker,RRG_EXTRA.get(ticker,ticker))) for ticker in selected_rrg_tickers}
+        palette=px.colors.qualitative.Bold+px.colors.qualitative.Safe
         for ticker, label in rrg_names.items():
             if ticker not in prices: continue
-            tail = rrg_frame(prices[ticker], prices["SPY"]).tail(tail_length)
+            tail = rrg_frame(prices[ticker], prices[rrg_benchmark]).tail(tail_length)
             if tail.empty: continue
             tails.append(tail)
-            color = COLORS.get(ticker, "#aeb9c8")
+            color = COLORS.get(ticker,palette[list(rrg_names).index(ticker)%len(palette)])
             fig.add_trace(go.Scatter(x=tail["rs_ratio"], y=tail["rs_momentum"], mode="lines+markers", name=ticker,
                 showlegend=False, line=dict(color=color, width=1.8),
                 marker=dict(color=color, size=np.linspace(3.5, 8.5, len(tail)), opacity=np.linspace(.3, 1, len(tail)), line=dict(color="#e9f1fb", width=.35)),
@@ -798,30 +1786,26 @@ with tab_rotation:
         fig.update_xaxes(title="RS-Ratio", range=xr); fig.update_yaxes(title="RS-Momentum", range=yr)
         st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
     with col_right:
-        section_header("RELATIVE STRENGTH", "RS vs SPX · 板块相对强弱", "相对 SPY 比率在观察期起点归一至 100；虚线为 200 日平滑。")
+        section_header("RELATIVE STRENGTH", f"Theme RS vs {rrg_benchmark} · 主题相对强弱", "当前观测池比率在观察期起点归一至 100；点线为 200 日平滑。")
         fig = go.Figure()
-        for ticker, (_, cn_name, _) in SECTORS.items():
-            pair = prices[[ticker, "SPY"]].dropna() if ticker in prices else pd.DataFrame()
+        for index,ticker in enumerate(selected_rrg_tickers):
+            pair = prices[[ticker,rrg_benchmark]].dropna() if ticker in prices else pd.DataFrame()
             if pair.empty: continue
-            ratio_full = pair[ticker].div(pair["SPY"])
+            ratio_full = pair[ticker].div(pair[rrg_benchmark])
             ratio = display_window(ratio_full,rs_horizon)
-            rebased = ratio.div(ratio.iloc[0]).mul(100); color = COLORS[ticker]
+            if ratio.empty: continue
+            rebased = ratio.div(ratio.iloc[0]).mul(100); color = COLORS.get(ticker,palette[index%len(palette)])
+            label=rrg_names.get(ticker,ticker)
             fig.add_trace(go.Scatter(x=rebased.index, y=rebased, mode="lines", name=ticker, line=dict(color=color, width=1.45),
-                hovertemplate=f"<b>{ticker} · {cn_name}</b><br>%{{x|%Y-%m-%d}}<br>RS %{{y:.2f}}<extra></extra>"))
+                hovertemplate=f"<b>{ticker} · {label}</b><br>%{{x|%Y-%m-%d}}<br>RS %{{y:.2f}}<extra></extra>"))
             # Calculate the true 200-day smoother before clipping to the display horizon.
             smooth_full = ratio_full.rolling(200,min_periods=200).mean().div(ratio.iloc[0]).mul(100)
             smooth = display_window(smooth_full,rs_horizon)
             fig.add_trace(go.Scatter(x=smooth.index, y=smooth, mode="lines", name=f"{ticker} 200D", showlegend=False, line=dict(color=color, width=.75, dash="dot"), hoverinfo="skip"))
-        spy_anchor=display_window(prices["SPY"].dropna(),rs_horizon)
-        if not spy_anchor.empty:
-            fig.add_trace(go.Scatter(x=spy_anchor.index,y=np.full(len(spy_anchor),100.0),name="SPY ANCHOR",
-                line=dict(color="#edf2f7",width=1.8,dash="dash"),hovertemplate="<b>SPY Anchor</b><br>%{x|%Y-%m-%d}<br>100.00<extra></extra>"))
-        q_pair=prices[["QQQ","SPY"]].dropna()
-        if not q_pair.empty:
-            q_ratio_full=q_pair["QQQ"].div(q_pair["SPY"]); q_ratio=display_window(q_ratio_full,rs_horizon)
-            q_rebased=q_ratio.div(q_ratio.iloc[0]).mul(100)
-            fig.add_trace(go.Scatter(x=q_rebased.index,y=q_rebased,name="QQQ / SPY ANCHOR",
-                line=dict(color="#d18cff",width=2.2),hovertemplate="<b>QQQ / SPY</b><br>%{x|%Y-%m-%d}<br>%{y:.2f}<extra></extra>"))
+        benchmark_anchor=display_window(prices[rrg_benchmark].dropna(),rs_horizon)
+        if not benchmark_anchor.empty:
+            fig.add_trace(go.Scatter(x=benchmark_anchor.index,y=np.full(len(benchmark_anchor),100.0),name=f"{rrg_benchmark} ANCHOR",
+                line=dict(color="#edf2f7",width=1.8,dash="dash"),hovertemplate=f"<b>{rrg_benchmark} Anchor</b><br>%{{x|%Y-%m-%d}}<br>100.00<extra></extra>"))
         base_layout(fig, 570, "x unified"); fig.add_hline(y=100, line_dash="dash", line_color="#728198", line_width=1)
         fig.update_xaxes(title=None); fig.update_yaxes(title="Relative Performance · Rebased 100")
         st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
@@ -847,6 +1831,56 @@ with tab_rotation:
         相对 SPY 位于 60/200MA 上方：<b>{'、'.join(strong) or '暂无'}</b>；潜伏观察：<b>{'、'.join(weak) or '暂无'}</b>。<br>
         20日成交金额方向代理净流入领先：<span style="color:#31d6a0">{inflow_text}</span>；净流出领先：<span style="color:#ff5874">{outflow_text}</span>。<br>
         <span style="color:#65768d">资金方向为 signed-dollar-volume 代理，并非 ETF 真实申赎。</span></div>""",unsafe_allow_html=True)
+
+    section_header("TACTICAL STOCK RADAR",f"个股多空强弱与异常量能 · {selected_theme}",f"价格、相对 {rrg_benchmark} 均线结构与 20 日相对量比；可按动能或 RVOL 快速排序。")
+    try:
+        theme_ohlcv=load_ohlcv(tuple(selected_rrg_tickers),"1y")
+    except Exception:
+        theme_ohlcv=pd.DataFrame()
+    tactical=theme_tactical_scoreboard(prices,theme_ohlcv,selected_rrg_tickers,rrg_benchmark)
+    tactical_sort=st.radio("战术排序",["动能强 → 弱","RVOL 高 → 低","观测池顺序"],horizontal=True,key="theme_tactical_sort")
+    if tactical.empty:
+        st.warning("当前主题个股历史或成交量数据不足，暂无法生成战术矩阵。")
+    else:
+        if tactical_sort=="动能强 → 弱": tactical=tactical.sort_values("_MomentumScore",ascending=False)
+        elif tactical_sort=="RVOL 高 → 低": tactical=tactical.sort_values("_RVOL",ascending=False,na_position="last")
+        else:
+            order={ticker:index for index,ticker in enumerate(selected_rrg_tickers)}
+            tactical=tactical.assign(_order=tactical["Ticker"].str.split(" · ").str[0].map(order)).sort_values("_order").drop(columns="_order")
+        tactical_display=tactical.drop(columns=["_MomentumScore","_RVOL"])
+        tactical_style=tactical_display.style.map(
+            lambda value:"background-color:rgba(246,196,83,.16);color:#f6c453;font-weight:700" if "异常放量" in str(value) else "",
+            subset=["RVOL (20D)"])
+        st.dataframe(tactical_style,use_container_width=True,hide_index=True,height=min(470,42+36*len(tactical_display)))
+
+    section_header("THEME OPTIONS UOA",f"今日期权伏击清单 · {selected_theme}","自动扫描主题成分股 7–30 DTE、现价 ±15% 的近虚值合约；阈值为 Volume ≥ 1.5×OI 且 Volume ≥ 500。")
+    with st.spinner("SCANNING THEME OPTIONS / 正在扫描主题期权链…"):
+        try:
+            theme_uoa=load_theme_option_uoa(tuple(selected_rrg_tickers))
+        except Exception:
+            theme_uoa=pd.DataFrame()
+    if theme_uoa.empty:
+        st.info("当前主题成分股未检测到极端虚值期权抢筹异动")
+    else:
+        uoa_style=theme_uoa.head(120).style.format({
+            "Strike":"${:,.2f}","Moneyness":"{:+.2f}%","Vol":"{:,.0f}","OI":"{:,.0f}","Vol/OI":"{:.2f}x"
+        },na_rep="—").map(lambda value:"color:#31d6a0;font-weight:700" if str(value)=="Call" else
+            ("color:#ff8f5a;font-weight:700" if str(value)=="Put" else ""),subset=["Type"])
+        st.dataframe(uoa_style,use_container_width=True,hide_index=True,height=min(510,42+35*min(len(theme_uoa),120)))
+        st.caption("Volume/OI 仅表示成交量相对存量异常，Yahoo 公开链不提供逐笔主动买卖与开平仓方向；‘抢筹/防守候选’需结合价格、IV 与后续 OI 复核。")
+
+    scoreboard=sector_rs_scoreboard(prices)
+    section_header("SECTOR SCOREBOARD","11 大行业多空全景矩阵","各行业 ETF / SPY 相对强度与 20EMA、50EMA、200SMA 的位置关系。")
+    score_sort=st.radio("状态排序",["默认行业顺序","强 → 弱","弱 → 强"],horizontal=True,key="scoreboard_sort")
+    if not scoreboard.empty and score_sort!="默认行业顺序":
+        regime_rank={"🔥 绝对强势":4,"⚡ 超跌反弹":3,"🔄 均线过渡":2,"⚠️ 强势回调":1,"❄️ 弱势破位":0}
+        scoreboard=scoreboard.assign(_rank=scoreboard["Regime 定性"].map(regime_rank).fillna(2)).sort_values("_rank",ascending=score_sort=="弱 → 强").drop(columns="_rank")
+    if scoreboard.empty:
+        st.warning("行业相对强度历史不足。")
+    else:
+        score_style=scoreboard.style.format({"RS vs 20EMA":"{:+.2f}%","RS vs 50EMA":"{:+.2f}%","RS vs 200SMA":"{:+.2f}%"},na_rep="—").map(
+            color_return,subset=["RS vs 20EMA","RS vs 50EMA","RS vs 200SMA"])
+        st.dataframe(score_style,use_container_width=True,hide_index=True,height=455)
 
 with tab_market:
     tape_tab, ndx_tab, matrix_tab = st.tabs(["MARKET BREADTH TAPE", "NDX LEADERS", "SECTOR MATRIX"])
@@ -1017,11 +2051,12 @@ with tab_heat:
                 color_continuous_scale=[(0,"#b51f32"),(.32,"#5c1d29"),(.5,"#34373c"),(.68,"#125338"),(1,"#00a85a")],
                 range_color=(-limit,limit),custom_data=["Company","Return","Market Weight","Tile Text"])
             tile_text=[str(custom[3]) if str(node_id).count("/")>=2 else "" for node_id,custom in zip(fig.data[0].ids,fig.data[0].customdata)]
-            fig.update_traces(text=tile_text,texttemplate="<b>%{label}</b><br>%{text}",hovertemplate="<b>%{label}</b><br>%{customdata[0]}<br>Return %{customdata[1]:+.2f}%<br>Weight proxy %{customdata[2]:.2f}%<extra></extra>",textfont=dict(size=15,color="#f7f8fa"),marker=dict(line=dict(color="#05070a",width=2.2)),root_color="#000000",tiling=dict(packing="squarify",pad=2))
-            fig.update_layout(template="plotly_dark",height=720,paper_bgcolor="#000000",plot_bgcolor="#000000",margin=dict(l=2,r=2,t=10,b=2),font=dict(family="Inter, Segoe UI, sans-serif",color="#f1f5fb"),coloraxis_colorbar=dict(title=f"{heat_period} %",thickness=11,len=.58,tickformat="+.1f"))
+            fig.update_traces(text=tile_text,texttemplate="<b>%{label}</b><br>%{text}",hovertemplate="<b>%{label}</b><br>%{customdata[0]}<br>Return %{customdata[1]:+.2f}%<br>Weight proxy %{customdata[2]:.2f}%<extra></extra>",textfont=dict(size=15,color="#f7f8fa"),marker=dict(line=dict(color="#05070a",width=2.2)),root_color="#0a0d14",tiling=dict(packing="squarify",pad=2))
+            base_layout(fig,720)
+            fig.update_layout(margin=dict(l=2,r=2,t=10,b=2),coloraxis_colorbar=dict(title=f"{heat_period} %",thickness=11,len=.58,tickformat="+.1f"))
             st.plotly_chart(fig,use_container_width=True,config={"displaylogo":False})
 
-    section_header("FLOW PROXY",f"{heat_index} · 20D Signed Dollar Volume","正值代表上涨日成交金额占优，负值代表下跌日成交金额占优；这是方向代理，不是真实基金申赎。")
+    section_header("TRADING PRESSURE",f"{heat_index} · 20D Secondary-Market Activity","仅衡量二级市场上涨/下跌日成交活跃度，不代表 ETF 申赎或一级市场资金流。")
     try:
         flow_close,flow_volume=load_flow_data(tuple(heat_universe),"3mo")
     except Exception:
@@ -1035,15 +2070,16 @@ with tab_heat:
         else: company,group,weight=meta
         flow_rows.append({"Group":group,"Ticker":ticker,"Company":company,"Market Weight":weight,"Flow":score,"Flow Text":f"{score:+.1f}%"})
     flow_df=pd.DataFrame(flow_rows)
-    if flow_df.empty: st.warning("资金方向代理暂无有效成交量数据。")
+    if flow_df.empty: st.warning("二级市场成交活跃度暂无有效数据。")
     else:
         flow_limit=max(20.0,float(flow_df["Flow"].abs().quantile(.92)))
-        flow_fig=px.treemap(flow_df,path=[px.Constant(f"{heat_index} FLOW"),"Group","Ticker"],values="Market Weight",color="Flow",
+        flow_fig=px.treemap(flow_df,path=[px.Constant(f"{heat_index} ACTIVITY"),"Group","Ticker"],values="Market Weight",color="Flow",
             color_continuous_scale=[(0,"#a61b3b"),(.5,"#2e333b"),(1,"#087f60")],range_color=(-flow_limit,flow_limit),
             custom_data=["Company","Flow","Flow Text"])
         flow_text=[str(custom[2]) if str(node_id).count("/")>=2 else "" for node_id,custom in zip(flow_fig.data[0].ids,flow_fig.data[0].customdata)]
-        flow_fig.update_traces(text=flow_text,texttemplate="<b>%{label}</b><br>%{text}",hovertemplate="<b>%{label}</b><br>%{customdata[0]}<br>20D Flow Proxy %{customdata[1]:+.1f}%<extra></extra>",marker=dict(line=dict(color="#05070a",width=2)),root_color="#000",tiling=dict(pad=2))
-        flow_fig.update_layout(template="plotly_dark",height=540,paper_bgcolor="#000",plot_bgcolor="#000",margin=dict(l=2,r=2,t=8,b=2),coloraxis_colorbar=dict(title="Flow %",thickness=11,len=.58))
+        flow_fig.update_traces(text=flow_text,texttemplate="<b>%{label}</b><br>%{text}",hovertemplate="<b>%{label}</b><br>%{customdata[0]}<br>20D Trading Pressure %{customdata[1]:+.1f}%<extra></extra>",marker=dict(line=dict(color="#05070a",width=2)),root_color="#0a0d14",tiling=dict(pad=2))
+        base_layout(flow_fig,540)
+        flow_fig.update_layout(margin=dict(l=2,r=2,t=8,b=2),coloraxis_colorbar=dict(title="Activity %",thickness=11,len=.58))
         st.plotly_chart(flow_fig,use_container_width=True,config={"displaylogo":False})
 
 with tab_macro:
@@ -1214,13 +2250,66 @@ with tab_technical:
         single_stats[1].metric("VS 200MA",format_num(dist200))
         single_stats[2].metric("PRICE Z-SCORE",format_num(latest_z,"σ"))
         single_stats[3].metric("200MA SLOPE",format_num(slope,"% / day"))
+
+        continuation={"detected":False,"reason":"OHLCV 数据暂不可用。"}
+        try:
+            continuation_panel=load_ohlcv((single_ticker,),"1y")
+            if not continuation_panel.empty and single_ticker in continuation_panel.columns.get_level_values(0):
+                continuation=continuation_price_diagnostics(continuation_panel[single_ticker])
+        except Exception as exc:
+            continuation={"detected":False,"reason":f"延续度诊断数据抓取失败：{exc}"}
+
+        oi_carry={"passed":None,"label":"⚪ OI 净增待确认","detail":"未触发突破诊断，暂不抓取期权链"}
+        if continuation.get("detected"):
+            try:
+                continuation_chain,continuation_spot=load_option_snapshot(single_ticker,8)
+                oi_carry=continuation_option_oi_carry(single_ticker,continuation_chain,continuation_spot)
+            except Exception as exc:
+                oi_carry={"passed":None,"label":"⚪ OI 数据不可用","detail":f"期权链抓取失败：{exc}"}
+
+            continuation_score=sum([
+                bool(continuation.get("avwap_pass")),bool(continuation.get("dryup_pass")),
+                bool(continuation.get("ema_pass")),oi_carry.get("passed") is True,
+            ])
+            if not continuation.get("avwap_pass"):
+                continuation_badge="❄️ 假突破失效（放弃观察）"; continuation_class="continuation-red"
+            elif continuation_score>=3:
+                continuation_badge="🔥 强趋势二次蓄势（胜率高，关注箱体突破）"; continuation_class="continuation-gold"
+            else:
+                continuation_badge="🔎 突破后整理观察（等待更多共振）"; continuation_class="continuation-watch"
+            dryup_text=f"{continuation['dryup']:.2f}×" if np.isfinite(continuation.get("dryup",np.nan)) else "等待样本"
+            ema_text=f"{continuation['ema_distance']:.2f}%" if np.isfinite(continuation.get("ema_distance",np.nan)) else "N/A"
+            avwap_gap=(continuation["price"]/continuation["avwap"]-1)*100 if continuation.get("avwap") else np.nan
+            st.markdown(f"""
+            <div class="continuation-panel">
+              <div class="continuation-head">
+                <div><span class="continuation-title">CONTINUATION FILTER · 个股异动与突破延续度</span><br><span class="continuation-badge {continuation_class}">{continuation_badge}</span></div>
+                <div class="continuation-meta">SCORE {continuation_score}/4 · ANCHOR {continuation['anchor']:%Y-%m-%d} · +{continuation['breakout_return']:.2f}% · RVOL {continuation['breakout_rvol']:.2f}× · {continuation['days_since']} BARS AGO</div>
+              </div>
+              <div class="continuation-grid">
+                <div class="continuation-item"><div class="continuation-label">01 · ANCHORED VWAP</div><div class="continuation-value">${continuation['avwap']:,.2f} · {avwap_gap:+.2f}%</div><div class="continuation-note">{continuation['avwap_label']}</div></div>
+                <div class="continuation-item"><div class="continuation-label">02 · VOLUME DRY-UP</div><div class="continuation-value">{dryup_text}</div><div class="continuation-note">{continuation['dryup_label']}</div></div>
+                <div class="continuation-item"><div class="continuation-label">03 · EMA20 CONVERGENCE</div><div class="continuation-value">{ema_text}</div><div class="continuation-note">{continuation['ema_label']}</div></div>
+                <div class="continuation-item"><div class="continuation-label">04 · OPTIONS OI CARRY</div><div class="continuation-value">CROSS-DAY CHECK</div><div class="continuation-note">{oi_carry['label']} · {oi_carry['detail']}</div></div>
+              </div>
+            </div>
+            """,unsafe_allow_html=True)
+        else:
+            st.info(f"CONTINUATION FILTER · {continuation.get('reason','当前未触发放量突破条件')}")
+
         single_full=pd.DataFrame({"price":s,"sma20":sma20,"sma50":sma50,"sma200":sma200,"zscore":price_z})
+        single_full["avwap"]=np.nan
+        if continuation.get("detected"):
+            single_full["avwap"]=continuation["avwap_series"].reindex(single_full.index)
         single_active=display_window(single_full,single_period)
         single_plot=display_with_preroll(single_full,single_period)
         single_fig=make_subplots(rows=2,cols=1,shared_xaxes=True,vertical_spacing=.07,row_heights=[.72,.28])
         single_fig.add_trace(go.Scatter(x=single_plot.index,y=single_plot["price"],name=single_ticker,line=dict(color="#4f86d9",width=2)),row=1,col=1)
         for name,column,color in [("SMA20","sma20","#31d6a0"),("SMA50","sma50","#e56f24"),("SMA200","sma200","#a8adb5")]:
             single_fig.add_trace(go.Scatter(x=single_plot.index,y=single_plot[column],name=name,line=dict(color=color,width=1.4)),row=1,col=1)
+        if continuation.get("detected"):
+            single_fig.add_trace(go.Scatter(x=single_plot.index,y=single_plot["avwap"],name="Anchored VWAP",
+                line=dict(color="#f4c34f",width=2.2,dash="dash")),row=1,col=1)
         single_fig.add_trace(go.Scatter(x=single_plot.index,y=single_plot["zscore"],name="Z-Score",line=dict(color="#a78bfa",width=1.7)),row=2,col=1)
         base_layout(single_fig,620,"x unified")
         single_fig.add_hline(y=2,line_dash="dash",line_color="#ff4f70",row=2,col=1)
@@ -1229,6 +2318,9 @@ with tab_technical:
         if not single_active.empty and single_active.index[0]>single_plot.index[0]:
             single_fig.add_vline(x=single_active.index[0].to_pydatetime(),line_dash="dot",line_color="#74849a",
                 annotation_text=f"{single_period} ACTIVE WINDOW",annotation_position="top left")
+        if continuation.get("detected") and continuation["anchor"]>=single_plot.index.min():
+            single_fig.add_vline(x=continuation["anchor"].to_pydatetime(),line_dash="dot",line_color="#f4c34f",
+                annotation_text="VOLUME BREAKOUT",annotation_position="top right",row=1,col=1)
         single_fig.update_layout(title=dict(text=f"{single_ticker} · Price / Moving Averages / Z-Score",font=dict(size=12,color="#f0a13a")))
         single_fig.update_yaxes(title="Price",row=1,col=1); single_fig.update_yaxes(title="Z",row=2,col=1)
         st.plotly_chart(single_fig,use_container_width=True,config={"displaylogo":False})
@@ -1409,6 +2501,173 @@ with tab_pattern:
             st.caption("图表交互：拖动空白区域框选可同时缩放 X/Y 轴；拖动坐标轴刻度可单独缩放该轴；滚轮缩放，双击恢复完整历史。")
             st.caption("自动形态识别存在滞后和误判可能。杠杆 ETF 受每日再平衡、波动损耗与路径依赖影响，不能用基础 ETF 的长期倍数简单外推。")
 
+with tab_options:
+    option_head,option_control,moneyness_control=st.columns([4.4,1.1,1.7],vertical_alignment="bottom")
+    with option_head:
+        section_header("OPTIONS INTELLIGENCE","Options UOA & Gamma · 期权异动雷达","扫描7–30 DTE 虚值合约；所有链路均独立容错并受15分钟缓存保护。")
+    with option_control:
+        option_symbol=st.selectbox("Underlying",OPTION_POOL,key="option_radar_symbol")
+    with moneyness_control:
+        moneyness_pct=st.slider("行权价偏离范围 · Strike Moneyness",10,30,15,5,format="±%d%%",key="uoa_moneyness")
+    try:
+        chain,spot=load_option_snapshot(option_symbol,4)
+    except Exception:
+        chain,spot=pd.DataFrame(),np.nan
+    unusual=unusual_option_rows(chain,spot,1.5,1000,moneyness_pct/100)
+    skew_ratio,skew_curve=option_skew_proxy(chain,spot)
+    option_cards=st.columns(4)
+    option_cards[0].metric("SPOT","N/A" if not np.isfinite(spot) else f"${spot:,.2f}")
+    option_cards[1].metric("UOA CONTRACTS",f"{len(unusual)}",">=1.5× OI · Vol>=1000",delta_color="off")
+    option_cards[2].metric("±4% OTM IV SKEW","N/A" if not np.isfinite(skew_ratio) else f"{skew_ratio:.3f}",
+                           "⚡ 倒挂警戒" if np.isfinite(skew_ratio) and skew_ratio>=.95 else "Call IV / Put IV",delta_color="off")
+    option_cards[3].metric("CHAIN STATUS","LIVE" if not chain.empty else "UNAVAILABLE",f"{chain['Expiration'].nunique() if not chain.empty else 0} expiries",delta_color="off")
+    if chain.empty:
+        st.warning(f"{option_symbol} 近月期权链暂不可用；Yahoo 限流或非交易时段可能导致空响应，请稍后重试。")
+    else:
+        uoa_col,skew_col=st.columns(2,gap="medium")
+        with uoa_col:
+            section_header("VOL > OI SCANNER","异常大单扫描",f"仅保留现价 ±{moneyness_pct}% 内的虚值合约；Volume >= 1.5×OI 且 Volume >= 1000。")
+            if unusual.empty:
+                st.info("当前链未发现满足阈值的虚值合约。")
+            else:
+                unusual_style=unusual.head(60).style.format({"Strike":"${:,.2f}","Moneyness":"{:+.1f}%","Vol":"{:,.0f}","OI":"{:,.0f}","Vol/OI":"{:.2f}×","IV":"{:.1f}%"},na_rep="—")
+                st.dataframe(unusual_style,use_container_width=True,hide_index=True,height=430)
+        with skew_col:
+            section_header("IV SKEW CURVE","Strike vs Implied Volatility","最近到期日；绿色为 Call IV，橙红为 Put IV。")
+            skew_fig=go.Figure()
+            for option_type,color in (("Call","#31d6a0"),("Put","#ff7857")):
+                curve=skew_curve[skew_curve["Type"].eq(option_type)].sort_values("strike") if not skew_curve.empty else pd.DataFrame()
+                if curve.empty: continue
+                skew_fig.add_trace(go.Scatter(x=curve["strike"],y=curve["impliedVolatility"]*100,name=f"{option_type} IV",
+                    mode="lines+markers",line=dict(color=color,width=2),marker=dict(size=5),hovertemplate="$%{x:.2f}<br>IV %{y:.1f}%<extra></extra>"))
+            base_layout(skew_fig,430,"x unified"); skew_fig.add_vline(x=spot,line_dash="dash",line_color="#f4f7fb",annotation_text=f"SPOT {spot:.2f}")
+            skew_fig.update_xaxes(title="Strike"); skew_fig.update_yaxes(title="Implied Volatility",ticksuffix="%")
+            st.plotly_chart(skew_fig,use_container_width=True,config={"displaylogo":False})
+
+        section_header("STRIKE OI PROFILE","Gamma 引力位 · Open Interest by Strike","OI 仅作为 Gamma 磁吸代理；未包含做市商净头寸方向与合约 Gamma。")
+        profile=chain[chain["strike"].between(spot*.70,spot*1.30)].copy()
+        profile=profile.groupby(["strike","Type"],as_index=False)["openInterest"].sum()
+        oi_fig=go.Figure()
+        for option_type,color,sign in (("Call","#31d6a0",1),("Put","#ff5874",-1)):
+            part=profile[profile["Type"].eq(option_type)]
+            oi_fig.add_trace(go.Bar(x=part["strike"],y=part["openInterest"]*sign,name=f"{option_type} OI",marker_color=color,
+                hovertemplate=f"{option_type} $%{{x:.2f}}<br>OI %{{customdata:,.0f}}<extra></extra>",customdata=part["openInterest"]))
+        base_layout(oi_fig,430); oi_fig.update_layout(barmode="relative")
+        oi_fig.add_vline(x=spot,line_dash="dash",line_color="#ffffff",line_width=2,annotation_text=f"SPOT ${spot:.2f}")
+        oi_fig.update_xaxes(title="Strike"); oi_fig.update_yaxes(title="Call OI (+) / Put OI (−)")
+        st.plotly_chart(oi_fig,use_container_width=True,config={"displaylogo":False})
+        st.caption("方法限制：Yahoo 链不提供 Delta 与逐笔买卖方向，因此本页使用 ±4% OTM IV 作为 25-Delta Skew 近似；Volume/OI 不能证明主动买入或新开仓。")
+
+with tab_flow:
+    flow_head,flow_control=st.columns([5,1.2],vertical_alignment="bottom")
+    with flow_head:
+        section_header("PRIMARY MARKET FLOW","08 ETF 一级市场份额追踪","TQQQ / SOXL 杠杆资金与 QQQ / SPY 基石资本；Daily Flow = ΔShares × Prior NAV。")
+    with flow_control:
+        flow_symbol=st.selectbox("ETF 选择器",list(PRIMARY_FLOW_ETFS),key="leveraged_flow_symbol",
+            format_func=lambda value:PRIMARY_FLOW_ETFS[value]["label"])
+    flow_frame=flow_snapshots.get(flow_symbol,pd.DataFrame())
+    if flow_symbol not in flow_snapshots:
+        try: flow_frame=load_primary_flow(flow_symbol)
+        except Exception: flow_frame=pd.DataFrame()
+    if flow_frame.empty:
+        st.warning(f"{flow_symbol} 价格序列暂时不可用，稍后刷新即可；系统不会以成交量估算申赎。")
+    else:
+        flow_meta=PRIMARY_FLOW_ETFS[flow_symbol]; extreme_threshold=float(flow_meta["threshold"])
+        valid_flow=flow_frame.dropna(subset=["DailyFlow"]); latest_flow=float(valid_flow["DailyFlow"].iloc[-1])
+        flow_source=str(flow_frame["Source"].iloc[-1]) if "Source" in flow_frame else "UNKNOWN"
+        verified_shares=bool(flow_frame["HasVerifiedShares"].iloc[-1]) if "HasVerifiedShares" in flow_frame else False
+        official_asof=pd.to_datetime(flow_frame["OfficialAsOf"].iloc[-1],errors="coerce") if "OfficialAsOf" in flow_frame else pd.NaT
+        logger_status=str(flow_frame["LoggerStatus"].iloc[-1]) if "LoggerStatus" in flow_frame else "LOGGER UNKNOWN"
+        record_count=int(flow_frame["RecordCount"].iloc[-1]) if "RecordCount" in flow_frame else 0
+        window=valid_flow.tail(60); close_low=float(window["Close"].min()); close_high=float(window["Close"].max())
+        price_low_zone=float(window["Close"].iloc[-1])<=close_low+.20*max(close_high-close_low,0)
+        latest_is_official=bool(window["HasOfficialRecord"].iloc[-1]) if "HasOfficialRecord" in window else False
+        flow_new_high=latest_flow>0 and latest_flow>=float(window["DailyFlow"].max())
+        divergence=verified_shares and latest_is_official and price_low_zone and flow_new_high
+        def compact_dollar(value: float) -> str:
+            if not np.isfinite(value): return "N/A"
+            return f"${value/1e9:+,.2f}B" if abs(value)>=1e9 else f"${value/1e6:+,.1f}M"
+        flow_cards=st.columns(4)
+        flow_cards[0].metric("LATEST VERIFIED FLOW",compact_dollar(latest_flow) if verified_shares else "N/A")
+        flow_cards[1].metric("60D MAX INFLOW",compact_dollar(float(window["DailyFlow"].max())) if verified_shares else "N/A")
+        flow_cards[2].metric("PRICE · 60D POSITION",f"${window['Close'].iloc[-1]:,.2f}","LOW ZONE" if price_low_zone else "MID / HIGH RANGE",delta_color="off")
+        flow_cards[3].metric("DIVERGENCE","🔥 极端底背离·吸筹确认" if divergence else "NO CONFIRMATION",delta_color="off")
+        if verified_shares:
+            asof_text=official_asof.strftime("%Y-%m-%d") if pd.notna(official_asof) else "N/A"
+            st.success(f"数据层：{flow_source} · 份额/NAV 截至 {asof_text} · {record_count:,} 条有效记录 · {logger_status}。未发布日期固定为 $0。")
+        else:
+            st.info(f"{flow_symbol} 尚无可验证的 Shares Outstanding 记录（{logger_status}）；流量柱严格保持 $0，仅展示市场价格，不进行任何成交量代理。")
+        flow_fig=make_subplots(specs=[[{"secondary_y":True}]])
+        scale=1e9 if max(float(flow_frame["DailyFlow"].abs().max()),extreme_threshold)>=1e9 else 1e6
+        unit="B" if scale==1e9 else "M"; flow_scaled=flow_frame["DailyFlow"]/scale; threshold_scaled=extreme_threshold/scale
+        bar_colors=np.where(flow_frame["DailyFlow"]>=extreme_threshold,"#f6c453",
+            np.where(flow_frame["DailyFlow"]<=-extreme_threshold,"#ff365f",
+                     np.where(flow_frame["DailyFlow"]>=0,"#31d6a0","#b9435a")))
+        flow_fig.add_trace(go.Bar(x=flow_frame.index,y=flow_scaled,name="Verified Daily Primary Flow",marker_color=bar_colors,
+            hovertemplate=f"%{{x|%Y-%m-%d}}<br>Flow $%{{y:+,.2f}}{unit}<extra></extra>"),secondary_y=False)
+        flow_fig.add_trace(go.Scatter(x=flow_frame.index,y=flow_frame["Close"],name=f"{flow_symbol} Close",
+            line=dict(color="#5aa2ff",width=2.2),hovertemplate="%{x|%Y-%m-%d}<br>Close $%{y:.2f}<extra></extra>"),secondary_y=True)
+        if "NAV" in flow_frame and flow_frame["NAV"].notna().any():
+            flow_fig.add_trace(go.Scatter(x=flow_frame.index,y=flow_frame["NAV"],name="Official NAV",
+                line=dict(color="#f6c453",width=1.5,dash="dot"),hovertemplate="%{x|%Y-%m-%d}<br>NAV $%{y:.4f}<extra></extra>"),secondary_y=True)
+        base_layout(flow_fig,600,"x unified")
+        threshold_label=compact_dollar(extreme_threshold).replace("+","")
+        flow_fig.add_hline(y=threshold_scaled,line_dash="dash",line_color="#f6c453",annotation_text=f"+{threshold_label} EXTREME")
+        flow_fig.add_hline(y=-threshold_scaled,line_dash="dash",line_color="#ff5874",annotation_text=f"-{threshold_label} EXTREME")
+        positive_events=flow_frame.loc[flow_frame["DailyFlow"].ge(extreme_threshold),"DailyFlow"]/scale
+        negative_events=flow_frame.loc[flow_frame["DailyFlow"].le(-extreme_threshold),"DailyFlow"]/scale
+        positive_text="🔥 主权级战略托底" if flow_symbol in ("QQQ","SPY") else "🔥 极端抄底流入"
+        negative_text="⚠️ 机构级巨量撤资" if flow_symbol in ("QQQ","SPY") else "⚠️ 极端净赎回"
+        for event_date,event_value in positive_events.tail(5).items():
+            flow_fig.add_annotation(x=event_date,y=event_value,text=positive_text,
+                showarrow=True,arrowhead=2,arrowcolor="#f6c453",font=dict(color="#f6c453",size=10),ax=0,ay=-32)
+        for event_date,event_value in negative_events.tail(5).items():
+            flow_fig.add_annotation(x=event_date,y=event_value,text=negative_text,
+                showarrow=True,arrowhead=2,arrowcolor="#ff5874",font=dict(color="#ff7187",size=10),ax=0,ay=32)
+        flow_fig.update_yaxes(title=f"Verified Creation / Redemption · ${unit}",secondary_y=False)
+        flow_fig.update_yaxes(title="NAV / Adjusted Close",secondary_y=True)
+        st.plotly_chart(flow_fig,use_container_width=True,config={"displaylogo":False,"scrollZoom":True})
+        st.caption(f"严格口径：仅使用已记录的 Shares Outstanding 与 NAV；无记录或接口失败日期流量为 0。{flow_meta['class']} 极端阈值 {threshold_label}。成交量、涨跌幅与 signed-dollar-volume 均不参与计算。")
+
+with tab_circuit:
+    section_header("SYSTEMIC RISK LOCKS","Circuit Breakers · 宏观与系统风控","三把安全锁：指数200SMA、信用风险偏好、VIX期限结构。")
+    risk_cards=st.columns(3)
+    risk_cards[0].metric("200 SMA TREND LOCK","🚨 LOCKED" if breakers["broken"] else "🟢 OPEN",
+                         "破位："+("、".join(breakers["broken"]) if breakers["broken"] else "无"),delta_color="off")
+    risk_cards[1].metric("CREDIT LIQUIDITY","⚠️ 收紧" if breakers["credit_warning"] else "🟢 正常",
+                         format_num(float(breakers["credit_change"]))+" · HYG/LQD 20D",delta_color="off")
+    risk_cards[2].metric("VIX TERM STRUCTURE","🚨 倒挂" if breakers["vix_inverted"] else "🟢 正向",
+                         "N/A" if not np.isfinite(float(breakers["vix_ratio"])) else f"VIX/VIX3M {breakers['vix_ratio']:.3f}",delta_color="off")
+    if breakers["credit_warning"]: st.warning("⚠️ 信用市场流动性收紧：HYG/LQD 跌破50日均线且20日动量为负。")
+    if breakers["vix_inverted"]: st.error("🚨 波动率倒挂：VIX / VIX3M >= 1.0，全市场防范无差别踩踏。")
+    risk_left,risk_right=st.columns(2,gap="medium")
+    with risk_left:
+        section_header("TREND & CREDIT","Index Trend Lock / Credit Ratio","指数归一化趋势与 HYG/LQD 信用风险偏好。")
+        risk_fig=make_subplots(rows=2,cols=1,shared_xaxes=True,vertical_spacing=.10)
+        for ticker,color in (("SPY","#31d6a0"),("QQQ","#4f86d9")):
+            s=prices[ticker].dropna().tail(504); rebased=s/s.iloc[0]*100; sma=s.rolling(200,min_periods=200).mean()/s.iloc[0]*100
+            risk_fig.add_trace(go.Scatter(x=s.index,y=rebased,name=ticker,line=dict(color=color,width=2)),row=1,col=1)
+            risk_fig.add_trace(go.Scatter(x=s.index,y=sma,name=f"{ticker} 200SMA",line=dict(color=color,width=1,dash="dash")),row=1,col=1)
+        credit=prices[["HYG","LQD"]].dropna(); credit_ratio=credit["HYG"].div(credit["LQD"]).tail(504)
+        risk_fig.add_trace(go.Scatter(x=credit_ratio.index,y=credit_ratio,name="HYG/LQD",line=dict(color="#f0a13a",width=2)),row=2,col=1)
+        risk_fig.add_trace(go.Scatter(x=credit_ratio.index,y=credit_ratio.rolling(50).mean(),name="50D",line=dict(color="#a8adb5",width=1.3,dash="dash")),row=2,col=1)
+        base_layout(risk_fig,600,"x unified"); risk_fig.update_yaxes(title="Rebased 100",row=1,col=1); risk_fig.update_yaxes(title="HYG/LQD",row=2,col=1)
+        st.plotly_chart(risk_fig,use_container_width=True,config={"displaylogo":False})
+    with risk_right:
+        section_header("VOLATILITY CURVE","VIX / VIX3M Term Structure","比率 >= 1 表示现货波动率高于三个月期限波动率。")
+        vix_pair=prices[["^VIX","^VIX3M"]].dropna().tail(504) if {"^VIX","^VIX3M"}.issubset(prices.columns) else pd.DataFrame()
+        if vix_pair.empty:
+            st.warning("VIX3M 数据暂不可用。")
+        else:
+            vol_fig=make_subplots(rows=2,cols=1,shared_xaxes=True,vertical_spacing=.10)
+            vol_fig.add_trace(go.Scatter(x=vix_pair.index,y=vix_pair["^VIX"],name="VIX",line=dict(color="#ff5874",width=2)),row=1,col=1)
+            vol_fig.add_trace(go.Scatter(x=vix_pair.index,y=vix_pair["^VIX3M"],name="VIX3M",line=dict(color="#4f86d9",width=2)),row=1,col=1)
+            term_ratio=vix_pair["^VIX"].div(vix_pair["^VIX3M"])
+            vol_fig.add_trace(go.Scatter(x=term_ratio.index,y=term_ratio,name="VIX/VIX3M",fill="tozeroy",line=dict(color="#f0a13a",width=2)),row=2,col=1)
+            vol_fig.add_hline(y=1,line_dash="dash",line_color="#ff5874",annotation_text="INVERSION",row=2,col=1)
+            base_layout(vol_fig,600,"x unified"); vol_fig.update_yaxes(title="Vol Index",row=1,col=1); vol_fig.update_yaxes(title="Ratio",row=2,col=1,range=[max(.5,float(term_ratio.min())*.95),max(1.15,float(term_ratio.max())*1.05)])
+            st.plotly_chart(vol_fig,use_container_width=True,config={"displaylogo":False})
+
 with tab_fixed:
     section_header("RATES TERMINAL", "U.S. Treasury Yield Curve · 美债期限结构",
                    "Yahoo Finance 可稳定覆盖的 13周、5年、10年与30年收益率指数；变化单位为基点。")
@@ -1484,6 +2743,110 @@ with tab_fixed:
             color_return,subset=["1D (bps)","1W (bps)","1M (bps)","YTD (bps)"])
         st.dataframe(yield_style,use_container_width=True,hide_index=True,height=220)
 
+with tab_xray:
+    section_header("LOOK-THROUGH RISK","ETF X-RAY · 底层真实杠杆敞口穿透器",
+                   "发行商持仓优先；输入为组合资金权重，名义权重不含杠杆，有效 Beta 敞口按 ETF 倍数放大。")
+    allocator=st.columns(4)
+    allocation={
+        "TQQQ":allocator[0].number_input("TQQQ · 3x 纳指 (%)",0.0,100.0,30.0,1.0,key="xray_tqqq"),
+        "SOXL":allocator[1].number_input("SOXL · 3x 半导体 (%)",0.0,100.0,20.0,1.0,key="xray_soxl"),
+        "QQQ":allocator[2].number_input("QQQ · 纳指基准 (%)",0.0,100.0,30.0,1.0,key="xray_qqq"),
+        "CASH":allocator[3].number_input("现金 (%)",0.0,100.0,20.0,1.0,key="xray_cash"),
+    }
+    allocation_sum=sum(allocation.values())
+    if abs(allocation_sum-100)>.01:
+        st.warning(f"当前权重合计 {allocation_sum:.1f}%，请调整至 100%；下方仍按输入原值计算，不进行隐式归一化。")
+    qqq_holdings,qqq_source=load_etf_holdings("QQQ"); soxx_holdings,soxx_source=load_etf_holdings("SOXX")
+    exposure_rows=[]
+    for portfolio_etf,lookthrough,leverage in (("TQQQ",qqq_holdings,3.0),("SOXL",soxx_holdings,3.0),("QQQ",qqq_holdings,1.0)):
+        portfolio_weight=allocation[portfolio_etf]/100
+        for _,holding in lookthrough.iterrows():
+            constituent_weight=float(holding["Weight"])/100
+            exposure_rows.append({"Ticker":holding["Ticker"],"Name":holding["Name"],
+                "Nominal":portfolio_weight*constituent_weight,"Effective":portfolio_weight*leverage*constituent_weight,
+                "Source ETF":portfolio_etf})
+    exposure=pd.DataFrame(exposure_rows)
+    if exposure.empty:
+        st.warning("底层持仓暂不可用。")
+    else:
+        aggregate=exposure.groupby(["Ticker","Name"],as_index=False)[["Nominal","Effective"]].sum()
+        aggregate["实际名义权重 (%)"]=aggregate["Nominal"]*100
+        aggregate["有效 Beta 敞口 (%)"]=aggregate["Effective"]*100
+        aggregate["集中度风险"]=np.where(aggregate["有效 Beta 敞口 (%)"]>25,"⚠️ 单一个股杠杆集中度过高","🟢 可控")
+        aggregate=aggregate.sort_values("有效 Beta 敞口 (%)",ascending=False)
+        gross_beta=(allocation["TQQQ"]*3+allocation["SOXL"]*3+allocation["QQQ"])/100
+        top_effective=float(aggregate["有效 Beta 敞口 (%)"].iloc[0]); top_name=str(aggregate["Ticker"].iloc[0])
+        xray_cards=st.columns(4)
+        xray_cards[0].metric("PORTFOLIO ALLOCATION",f"{allocation_sum:.1f}%",delta_color="off")
+        xray_cards[1].metric("GROSS BETA EXPOSURE",f"{gross_beta:.2f}x",delta_color="off")
+        xray_cards[2].metric("TOP LOOK-THROUGH",top_name,f"{top_effective:.2f}% effective",delta_color="off")
+        xray_cards[3].metric("CONCENTRATION LOCK","🚨 HIGH" if top_effective>25 else "🟢 CONTROLLED",delta_color="off")
+        table_col,chart_col=st.columns([1.0,1.15],gap="medium")
+        with table_col:
+            section_header("CORE HOLDINGS","组合穿透前十大核心重仓股","同一股票在 QQQ 与半导体篮子中的敞口合并计算。")
+            output=aggregate.head(10)[["Ticker","Name","实际名义权重 (%)","有效 Beta 敞口 (%)","集中度风险"]]
+            style=output.style.format({"实际名义权重 (%)":"{:.2f}%","有效 Beta 敞口 (%)":"{:.2f}%"}).map(
+                lambda value:"color:#ff5874;font-weight:700" if str(value).startswith("⚠️") else "color:#31d6a0",subset=["集中度风险"])
+            st.dataframe(style,use_container_width=True,hide_index=True,height=430)
+        with chart_col:
+            section_header("LEVERAGE MAP","Nominal vs Effective Exposure","橙色为投入资本穿透，青色为考虑 3 倍杠杆后的有效 Beta 冲击。")
+            top=aggregate.head(10).sort_values("有效 Beta 敞口 (%)")
+            xray_fig=go.Figure()
+            xray_fig.add_trace(go.Bar(y=top["Ticker"],x=top["实际名义权重 (%)"],orientation="h",name="Nominal Weight",marker_color="#f0a13a"))
+            xray_fig.add_trace(go.Bar(y=top["Ticker"],x=top["有效 Beta 敞口 (%)"],orientation="h",name="Effective Beta",marker_color="#35d5ff"))
+            xray_fig.add_vline(x=25,line_dash="dash",line_color="#ff5874",annotation_text="25% CONCENTRATION")
+            base_layout(xray_fig,430,"y unified"); xray_fig.update_layout(barmode="group"); xray_fig.update_xaxes(title="Portfolio Exposure (%)")
+            st.plotly_chart(xray_fig,use_container_width=True,config={"displaylogo":False})
+        st.caption(f"QQQ 底层来源：{qqq_source} · SOXL 使用 SOXX 穿透，来源：{soxx_source}。发行商接口失败时会明确标记为内置参考基准；不会伪装成实时持仓。")
+
+with tab_deep:
+    section_header("MACRO FINANCIAL CONDITIONS","Macro Deep Dive · FRED 宏观金融压力与真实通胀",
+                   "免 API Key 直连 FRED / OFR 官方 CSV；失败时回退至随应用发布的注明日期的历史快照。")
+    fred_ids=("NFCI","OFRFSI","PCETRIM12M159SFRBDAL","PCETRIM1M158SFRBDAL","PCEPILFE","PCEPI","PI","PCE")
+    fred,fred_status=load_fred_series(fred_ids)
+    offline_ids=[series_id for series_id,source in fred_status.items() if source=="offline"]
+    unavailable_ids=[series_id for series_id,source in fred_status.items() if source=="unavailable"]
+    if offline_ids:
+        offline_dates=[f"{series_id} {fred[series_id].dropna().index[-1]:%Y-%m-%d}" for series_id in offline_ids]
+        st.caption("离线基准（非实时）："+" · ".join(offline_dates)+"。网络恢复后将优先使用官方新值。")
+    if unavailable_ids:
+        st.info("以下序列本次不可用："+", ".join(unavailable_ids)+"。")
+    macro_left,macro_right=st.columns(2,gap="medium")
+    with macro_left:
+        nfci=fred["NFCI"].dropna() if "NFCI" in fred else pd.Series(dtype=float)
+        latest_nfci=float(nfci.iloc[-1]) if not nfci.empty else np.nan
+        section_header("FINANCIAL CONDITIONS",f"NFCI · Current {'N/A' if not np.isfinite(latest_nfci) else f'{latest_nfci:+.3f}'}",
+                       "0 为历史中性；负值表示金融条件偏宽松，正值表示偏收紧。")
+        if nfci.empty: st.info("NFCI 暂不可用。")
+        else:
+            view=nfci[nfci.index>=nfci.index[-1]-pd.Timedelta(days=365)]
+            nfci_fig=go.Figure(go.Scatter(x=view.index,y=view,mode="lines",name="NFCI",fill="tozeroy",
+                line=dict(color="#31d6a0" if latest_nfci<0 else "#ff5874",width=2.2)))
+            nfci_fig.add_hline(y=0,line_dash="dash",line_color="#9aa8b9",annotation_text="NEUTRAL")
+            base_layout(nfci_fig,420,"x unified"); nfci_fig.update_yaxes(title="NFCI")
+            st.plotly_chart(nfci_fig,use_container_width=True,config={"displaylogo":False})
+    with macro_right:
+        ofr=fred["OFRFSI"].dropna() if "OFRFSI" in fred else pd.Series(dtype=float)
+        latest_ofr=float(ofr.iloc[-1]) if not ofr.empty else np.nan
+        section_header("SYSTEMIC STRESS",f"OFR Financial Stress Index · Current {'N/A' if not np.isfinite(latest_ofr) else f'{latest_ofr:+.2f}'}",
+                       "0 为中性压力；+2 为本面板的战术高压警戒线。")
+        if ofr.empty: st.info("OFR FSI 暂不可用。")
+        else:
+            view=ofr[ofr.index>=ofr.index[-1]-pd.Timedelta(days=365)]
+            ofr_fig=go.Figure(go.Scatter(x=view.index,y=view,mode="lines",name="OFR FSI",fill="tozeroy",line=dict(color="#f0a13a",width=2.2)))
+            ofr_fig.add_hline(y=0,line_dash="dash",line_color="#9aa8b9",annotation_text="NEUTRAL")
+            ofr_fig.add_hline(y=2,line_dash="dot",line_color="#ff5874",annotation_text="EXTREME STRESS")
+            base_layout(ofr_fig,420,"x unified"); ofr_fig.update_yaxes(title="OFR FSI")
+            st.plotly_chart(ofr_fig,use_container_width=True,config={"displaylogo":False})
+    section_header("INFLATION TAPE","Inflation · Last 12 Monthly Releases",
+                   "Headline/Core 为价格指数同比；Trimmed Mean 采用 Dallas Fed 官方序列；收入与支出为环比。每行独立着色，绿色为该行低位、红色为高位。")
+    inflation=inflation_release_table(fred)
+    if inflation.empty:
+        st.info("通胀与收支月度序列暂不可用。")
+    else:
+        st.dataframe(heat_style_table(inflation),use_container_width=True,height=285)
+        st.caption("单位：% · 6M Trimmed Mean 由官方 1M 年化序列按复合方式计算。FRED 数据发布存在月度/周度时滞，标题中的当前值指各自最后有效发布日期。")
+
 with tab_pulse:
     section_header("EVENT PULSE", "Breaking News & Market Data · 爆点新闻与数据", "新闻来自 Yahoo Finance；市场影响由可复现的价格、波动率、信用与广度规则评估。")
     signal_rows=[]
@@ -1543,4 +2906,4 @@ with tab_pulse:
                 column_config={"URL":st.column_config.LinkColumn("Open",display_text="↗ Read")})
     st.caption("自动解读依据市场代理指标而非自然语言情绪模型；突发新闻本身仍需阅读原文并核验发布时间。")
 
-st.caption(f"DATA {latest_date:%Y-%m-%d} · SOURCE YAHOO FINANCE · ADJUSTED DAILY CLOSE · 1H CACHE · STATIC SECTOR / CONSTITUENT WEIGHTS ARE VISUAL PROXIES · FOR RESEARCH ONLY, NOT INVESTMENT ADVICE")
+st.caption(f"DATA {latest_date:%Y-%m-%d} · SOURCE YAHOO FINANCE · LIVE PULSE CACHE 45S · RESEARCH CACHE 15M · STATIC SECTOR / CONSTITUENT WEIGHTS ARE VISUAL PROXIES · FOR RESEARCH ONLY, NOT INVESTMENT ADVICE")
