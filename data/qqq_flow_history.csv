@@ -1,0 +1,2 @@
+date,shares_outstanding,nav,source_url,source_note
+2026-10-06,669500000,759.498857,https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/46090E103/prices?idType=cusip&productType=ETF&variationType=priceListing&productSubType=ETF,Invesco official QQQ prices API

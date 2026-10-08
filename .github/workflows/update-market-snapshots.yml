@@ -1,0 +1,36 @@
+name: Update official ETF shares and option snapshots
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 02:37 UTC Tue-Sat follows the prior US trading session, including DST.
+    - cron: '37 2 * * 2-6'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: market-snapshots
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python scripts/update_market_snapshots.py
+      - name: Commit verified observations and dated option snapshots
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- data/
+          if ! git diff --cached --quiet; then
+            git commit -m "Update verified ETF shares and option snapshots"
+            git push origin HEAD:main
+          fi

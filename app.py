@@ -413,7 +413,7 @@ def us_market_status(now_et: datetime | None = None) -> dict[str,str]:
 
 
 @st.cache_data(ttl=900,show_spinner=False)
-def load_option_snapshot(symbol: str,max_expiries: int=2) -> tuple[pd.DataFrame,float]:
+def load_option_snapshot(symbol: str,max_expiries: int=2,allow_saved_snapshot: bool=False) -> tuple[pd.DataFrame,float]:
     """Download 7-30 DTE option chains; individual expiries fail independently."""
     ticker=yf.Ticker(symbol); spot=np.nan
     try:
@@ -447,11 +447,34 @@ def load_option_snapshot(symbol: str,max_expiries: int=2) -> tuple[pd.DataFrame,
         except Exception:
             continue
     if not frames:
-        return pd.DataFrame(),spot
+        if not allow_saved_snapshot:
+            return pd.DataFrame(),spot
+        try:
+            saved=pd.read_csv(Path(__file__).resolve().parent/"data"/"options_chain_latest.csv")
+            saved=saved[saved["Symbol"].eq(symbol)].copy()
+            saved["SnapshotAtUTC"]=pd.to_datetime(saved["SnapshotAtUTC"],utc=True,errors="coerce")
+            newest=saved["SnapshotAtUTC"].max()
+            if pd.isna(newest) or pd.Timestamp.now(tz="UTC")-newest>pd.Timedelta(days=7):
+                return pd.DataFrame(),spot
+            saved=saved[saved["SnapshotAtUTC"].eq(newest)]
+            saved["Expiration"]=saved["Expiration"].astype(str)
+            saved=saved[pd.to_datetime(saved["Expiration"],errors="coerce").dt.date.ge(today)]
+            saved=saved[saved["Expiration"].isin(sorted(saved["Expiration"].unique())[:max(1,max_expiries)])]
+            if saved.empty: return pd.DataFrame(),spot
+            for column in ("strike","volume","openInterest","impliedVolatility","bid","ask","lastPrice"):
+                saved[column]=pd.to_numeric(saved[column],errors="coerce")
+            spot=float(pd.to_numeric(saved["SpotAtCapture"],errors="coerce").dropna().iloc[-1])
+            saved.attrs["source"]="SAVED SNAPSHOT"
+            saved.attrs["asof_utc"]=newest.isoformat()
+            return saved,spot
+        except (OSError,KeyError,ValueError,IndexError,pd.errors.ParserError):
+            return pd.DataFrame(),spot
     result=pd.concat(frames,ignore_index=True)
     for column in ("strike","volume","openInterest","impliedVolatility","bid","ask","lastPrice"):
         if column not in result: result[column]=np.nan
         result[column]=pd.to_numeric(result[column],errors="coerce")
+    result.attrs["source"]="LIVE YAHOO"
+    result.attrs["asof_utc"]=pd.Timestamp.now(tz="UTC").isoformat()
     return result,spot
 
 
@@ -2510,7 +2533,7 @@ with tab_options:
     with moneyness_control:
         moneyness_pct=st.slider("行权价偏离范围 · Strike Moneyness",10,30,15,5,format="±%d%%",key="uoa_moneyness")
     try:
-        chain,spot=load_option_snapshot(option_symbol,4)
+        chain,spot=load_option_snapshot(option_symbol,4,allow_saved_snapshot=True)
     except Exception:
         chain,spot=pd.DataFrame(),np.nan
     unusual=unusual_option_rows(chain,spot,1.5,1000,moneyness_pct/100)
@@ -2520,10 +2543,13 @@ with tab_options:
     option_cards[1].metric("UOA CONTRACTS",f"{len(unusual)}",">=1.5× OI · Vol>=1000",delta_color="off")
     option_cards[2].metric("±4% OTM IV SKEW","N/A" if not np.isfinite(skew_ratio) else f"{skew_ratio:.3f}",
                            "⚡ 倒挂警戒" if np.isfinite(skew_ratio) and skew_ratio>=.95 else "Call IV / Put IV",delta_color="off")
-    option_cards[3].metric("CHAIN STATUS","LIVE" if not chain.empty else "UNAVAILABLE",f"{chain['Expiration'].nunique() if not chain.empty else 0} expiries",delta_color="off")
+    chain_source=chain.attrs.get("source","UNAVAILABLE") if not chain.empty else "UNAVAILABLE"
+    option_cards[3].metric("CHAIN STATUS",chain_source,f"{chain['Expiration'].nunique() if not chain.empty else 0} expiries",delta_color="off")
     if chain.empty:
         st.warning(f"{option_symbol} 近月期权链暂不可用；Yahoo 限流或非交易时段可能导致空响应，请稍后重试。")
     else:
+        asof_utc=chain.attrs.get("asof_utc","")
+        st.caption(f"期权链来源：{chain_source} · 采集时间 UTC：{asof_utc}。历史快照仅供回看，不代表实时盘口或今日异动。")
         uoa_col,skew_col=st.columns(2,gap="medium")
         with uoa_col:
             section_header("VOL > OI SCANNER","异常大单扫描",f"仅保留现价 ±{moneyness_pct}% 内的虚值合约；Volume >= 1.5×OI 且 Volume >= 1000。")
@@ -2556,6 +2582,21 @@ with tab_options:
         oi_fig.add_vline(x=spot,line_dash="dash",line_color="#ffffff",line_width=2,annotation_text=f"SPOT ${spot:.2f}")
         oi_fig.update_xaxes(title="Strike"); oi_fig.update_yaxes(title="Call OI (+) / Put OI (−)")
         st.plotly_chart(oi_fig,use_container_width=True,config={"displaylogo":False})
+        section_header("FULL OPTION CHAIN","完整近月 Call / Put 期权链","选择到期日和方向查看全部可用合约；快照数据明确标注采集时间。")
+        chain_controls=st.columns([1,1,3])
+        with chain_controls[0]:
+            chosen_expiry=st.selectbox("到期日",sorted(chain["Expiration"].astype(str).unique()),key="full_chain_expiry")
+        with chain_controls[1]:
+            chosen_type=st.selectbox("方向",["Call","Put","All"],key="full_chain_type")
+        shown=chain[chain["Expiration"].astype(str).eq(chosen_expiry)].copy()
+        if chosen_type!="All": shown=shown[shown["Type"].eq(chosen_type)]
+        shown=shown[shown["strike"].between(spot*.70,spot*1.30)] if np.isfinite(spot) else shown
+        columns={"contractSymbol":"Contract","Type":"Type","strike":"Strike","bid":"Bid","ask":"Ask","lastPrice":"Last","volume":"Vol","openInterest":"OI","impliedVolatility":"IV"}
+        for column in columns:
+            if column not in shown: shown[column]=np.nan
+        shown=shown[list(columns)].rename(columns=columns).sort_values("Strike")
+        shown["IV"]=shown["IV"]*100
+        st.dataframe(shown.style.format({"Strike":"${:,.2f}","Bid":"${:,.2f}","Ask":"${:,.2f}","Last":"${:,.2f}","Vol":"{:,.0f}","OI":"{:,.0f}","IV":"{:.1f}%"},na_rep="—"),use_container_width=True,hide_index=True,height=470)
         st.caption("方法限制：Yahoo 链不提供 Delta 与逐笔买卖方向，因此本页使用 ±4% OTM IV 作为 25-Delta Skew 近似；Volume/OI 不能证明主动买入或新开仓。")
 
 with tab_flow:

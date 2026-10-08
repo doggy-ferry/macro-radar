@@ -1,0 +1,6 @@
+{
+  "symbol": "SOXL",
+  "records": [],
+  "source_url": "https://www.direxion.com/product/daily-semiconductor-bull-bear-3x-etfs",
+  "source_note": "Direxion currently publishes NAV on the public product page but not a historical daily Shares Outstanding series. Add only issuer-verified date/shares_outstanding/nav records here; price or volume must never be substituted."
+}
