@@ -7,6 +7,8 @@ The files in this directory are the verified baseline and append-only local obse
 - `soxl_shares_baseline.json` is the guarded SOXL baseline patch. Direxion's public product page currently exposes NAV but not a historical daily Shares Outstanding field, so its record list intentionally remains empty until issuer-verifiable values are available.
 - `{ticker}_flow_history.csv` is initialized automatically and receives a new row only when the issuer endpoint supplies both NAV and Shares Outstanding for a date not already present.
 - QQQ uses Invesco's official public prices API (`CUSIP 46090E103`), which reports the effective date, NAV and Shares Outstanding. The local logger builds its daily history forward from each valid response.
+- `soxx_shares_history.csv` starts with the issuer-verified 2026-10-09 SOXX observation and accepts future dated iShares observations. The iShares product page currently exposes a latest-day snapshot, not a downloadable one-year daily shares history.
+- `smh_shares_history.csv` is schema-initialized but intentionally contains no observations: VanEck's accessible SMH product page publishes NAV/assets/holdings, not a verified daily shares-outstanding history. Do not derive shares from rounded AUM/NAV or insert synthetic rows. Until a verified source is available, the app shows the SMH price chart and explicitly marks its primary-market flow as unavailable.
 
 Required columns are `date`, `shares_outstanding`, and `nav`. Optional provenance columns are `source_url` and `source_note`.
 

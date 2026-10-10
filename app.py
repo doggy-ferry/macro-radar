@@ -26,6 +26,7 @@ import yfinance as yf
 from ui_theme import inject_theme, apply_quant_theme
 from dual_rrg import FLOW_TICKERS, build_flow_rrg, flow_quadrant, convergence_label
 from sector_options import sector_option_signal
+from tactical_signals import participation_metrics, early_rrg_signals
 
 try:
     from scipy.signal import argrelextrema
@@ -170,6 +171,8 @@ PRIMARY_FLOW_ETFS = {
     "SOXL": {"label":"SOXL (3x 半导体)","threshold":500_000_000.0,"class":"杠杆 ETF"},
     "QQQ": {"label":"QQQ (纳指基准)","threshold":1_500_000_000.0,"class":"基石 ETF"},
     "SPY": {"label":"SPY (标普基准)","threshold":1_500_000_000.0,"class":"基石 ETF"},
+    "SOXX": {"label":"SOXX (iShares 半导体)","threshold":300_000_000.0,"class":"芯片 ETF"},
+    "SMH": {"label":"SMH (VanEck 半导体)","threshold":300_000_000.0,"class":"芯片 ETF"},
 }
 COLORS = {
     "XLK": "#40c4ff", "XLC": "#8b7cff", "XLY": "#ff8f5a", "XLI": "#b7c5d8", "XLE": "#00d7a3",
@@ -679,20 +682,24 @@ def theme_tactical_scoreboard(price_frame: pd.DataFrame,ohlcv: pd.DataFrame,tick
         elif above200: regime="⚠️ 强势回调"
         else: regime="❄️ 弱势破位"
         close=pair[ticker].dropna(); price=float(close.iloc[-1]); day_return=last_return(close,1)
-        rvol=np.nan
+        metrics=participation_metrics(pd.DataFrame())
         try:
             ticker_frame=ohlcv[ticker].dropna(subset=["Close"]) if ticker in ohlcv.columns.get_level_values(0) else pd.DataFrame()
-            volume=pd.to_numeric(ticker_frame.get("Volume"),errors="coerce").dropna()
-            if len(volume)>=21 and float(volume.iloc[-21:-1].mean())>0:
-                rvol=float(volume.iloc[-1]/volume.iloc[-21:-1].mean())
+            metrics=participation_metrics(ticker_frame)
         except Exception:
             pass
+        rvol=metrics["rvol"]; dollar_volume=metrics["dollar_volume_m"]
+        volume_trend=metrics["volume_trend_pct"]; avwap_distance=metrics["avwap_distance_pct"]
         rows.append({
             "Ticker":f"{ticker} · {TACTICAL_NAMES.get(ticker,SECTORS.get(ticker,(ticker,ticker,0))[1])}",
             "Price":f"${price:,.2f} · {day_return:+.2f}%" if np.isfinite(day_return) else f"${price:,.2f}",
             "RS vs 20EMA":f"{'🟢 Above' if above20 else '🔴 Below'} ({d20:+.2f}%)",
             "RS vs 50EMA":f"{'🟢 Above' if above50 else '🔴 Below'} ({d50:+.2f}%)",
-            "RVOL (20D)":f"🔥 异常放量 · {rvol:.2f}x" if np.isfinite(rvol) and rvol>=1.8 else (f"{rvol:.2f}x" if np.isfinite(rvol) else "N/A"),
+            "RVOL (20D)":f"🔥 资金爆量 · {rvol:.2f}x" if np.isfinite(rvol) and rvol>=2.0 else (f"{rvol:.2f}x" if np.isfinite(rvol) else "N/A"),
+            "Dollar Volume ($M)":f"${dollar_volume:,.1f}" if np.isfinite(dollar_volume) else "N/A",
+            "Volume Trend (5D vs 20D)":f"{volume_trend:+.1f}%" if np.isfinite(volume_trend) else "N/A",
+            "AVWAP 机构成本线状态":(f"🟢 Above ({avwap_distance:+.1f}%)" if avwap_distance>=0 else
+                                    f"🔴 Below ({avwap_distance:+.1f}%)") if np.isfinite(avwap_distance) else "N/A",
             "Regime 状态定性":regime,
             "_MomentumScore":float(np.nan_to_num(d20)+np.nan_to_num(d50)+np.nan_to_num(day_return)*.25),
             "_RVOL":rvol,
@@ -736,6 +743,7 @@ def _normalise_flow_records(frame: pd.DataFrame) -> pd.DataFrame:
 def _read_baseline_records(symbol: str) -> pd.DataFrame:
     data_dir=Path(__file__).resolve().parent/"data"; frames=[]
     for path in (data_dir/f"{symbol.lower()}_shares_baseline.csv",
+                 data_dir/f"{symbol.lower()}_shares_history.csv",
                  data_dir/f"{symbol.lower()}_historical_shares.csv",
                  data_dir/f"{symbol.lower()}_flow_history.csv"):
         try:
@@ -851,6 +859,21 @@ def fetch_issuer_flow_records(symbol: str) -> pd.DataFrame:
     """Fetch only issuer-published NAV/share observations; no price-volume proxy."""
     symbol=symbol.upper().strip(); headers={"User-Agent":"Mozilla/5.0 (compatible; BuySideQuantPortal/1.0)"}
     try:
+        if symbol=="SOXX":
+            url="https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf"
+            page=html.unescape(requests.get(url,headers={"User-Agent":"Mozilla/5.0"},timeout=15).text)
+            shares_match=re.search(r'"sharesOutstanding":(\{[^{}]*\})',page)
+            nav_match=re.search(r'"name":"NAV as of","value":"([\d,.]+)"[^{}]*"valueReference":\{[^{}]*"value":"([^"]+)"',page)
+            if shares_match and nav_match:
+                share_data=json.loads(shares_match.group(1))
+                share_date=pd.to_datetime(share_data.get("formattedAsOfDate"),errors="coerce")
+                nav_date=pd.to_datetime(nav_match.group(2),errors="coerce")
+                if pd.notna(share_date) and pd.notna(nav_date) and share_date.normalize()==nav_date.normalize():
+                    return _normalise_flow_records(pd.DataFrame([{
+                        "date":share_date,"shares_outstanding":str(share_data.get("formattedValue","")).replace(",",""),
+                        "nav":nav_match.group(1).replace(",",""),"source_url":url,
+                        "source_note":"iShares official SOXX shares and NAV",
+                    }]))
         if symbol=="TQQQ":
             url="https://accounts.profunds.com/etfdata/ByFund/TQQQ-historical_nav.csv"
             raw=pd.read_csv(StringIO(urlopen(Request(url,headers=headers),timeout=20).read().decode("utf-8-sig",errors="replace")))
@@ -924,7 +947,7 @@ def _persist_latest_flow_record(symbol: str, records: pd.DataFrame) -> str:
 
 @st.cache_data(ttl=900,show_spinner=False)
 def load_primary_flow(symbol: str) -> pd.DataFrame:
-    """Merge verified baselines, issuer updates and price, assigning zero to missing record dates."""
+    """Merge issuer observations and price; zero display bars never imply verified flows."""
     symbol=symbol.upper().strip(); end=date.today()+timedelta(days=1); start=end-timedelta(days=550)
     try:
         history=yf.Ticker(symbol).history(start=start,end=end,auto_adjust=True)[["Close"]].dropna(subset=["Close"])
@@ -945,7 +968,8 @@ def load_primary_flow(symbol: str) -> pd.DataFrame:
     if records.empty:
         data["Shares"]=np.nan; data["NAV"]=np.nan; data["DailyFlow"]=0.0
         data["Source"]="NO VERIFIED ISSUER SHARES DATA"; data["OfficialAsOf"]=pd.NaT
-        data["HasVerifiedShares"]=False; data["LoggerStatus"]=logger_status; data["RecordCount"]=0
+        data["HasVerifiedShares"]=False; data["HasVerifiedFlow"]=False
+        data["LoggerStatus"]=logger_status; data["RecordCount"]=0
         return data.tail(180)
 
     data["Shares"]=records["shares_outstanding"].reindex(data.index).ffill()
@@ -954,8 +978,9 @@ def load_primary_flow(symbol: str) -> pd.DataFrame:
     reported_delta=records["shares_outstanding"].diff()
     # A sparse baseline must never collapse weeks/months of creations into one fake daily spike.
     adjacent=records.index.to_series().diff().dt.days.le(5)
-    record_flow=(reported_delta*prior_nav).where(adjacent,0.0)
+    record_flow=(reported_delta*prior_nav).where(adjacent)
     data["DailyFlow"]=record_flow.reindex(data.index).where(data["HasOfficialRecord"],0.0).fillna(0.0)
+    data["HasVerifiedFlow"]=data.index.isin(record_flow.dropna().index)
     data["OfficialAsOf"]=records.index.max(); data["HasVerifiedShares"]=True
     source_notes=records["source_note"].dropna().astype(str); source_notes=source_notes[source_notes.str.len().gt(0)]
     data["Source"]=" + ".join(dict.fromkeys(source_notes.tail(4))) or "LOCAL VERIFIED BASELINE"
@@ -1890,6 +1915,35 @@ with tab_rotation:
         st.success(f"🎯 弱转强自动诊断：{'、'.join(theme_crossovers)} 最近3日由 Lagging 跨入 Improving。")
     else:
         st.info("弱转强自动诊断：当前主题暂无 Lagging → Improving 的三日确认信号。")
+    try:
+        theme_ohlcv=load_ohlcv(tuple(selected_rrg_tickers),"1y")
+    except Exception:
+        theme_ohlcv=pd.DataFrame()
+    ambush_candidates=[]; climax_candidates=[]
+    for ticker in selected_rrg_tickers:
+        if ticker not in prices or rrg_benchmark not in prices:
+            continue
+        try:
+            tail=rrg_frame(prices[ticker],prices[rrg_benchmark])
+            ticker_ohlcv=(theme_ohlcv[ticker] if isinstance(theme_ohlcv.columns,pd.MultiIndex)
+                          and ticker in theme_ohlcv.columns.get_level_values(0) else pd.DataFrame())
+            volume_trend=participation_metrics(ticker_ohlcv)["volume_trend_pct"]
+            ambush,climax=early_rrg_signals(tail,prices[ticker],prices[rrg_benchmark],
+                volume_trend_pct=volume_trend,five_day_official_flow=flow_five_day.get(ticker,np.nan))
+            if ambush: ambush_candidates.append(ticker)
+            if climax: climax_candidates.append(ticker)
+        except (KeyError,ValueError,TypeError,IndexError):
+            continue
+    section_header("EARLY AMBUSH RADAR","早期埋伏与防追高雷达",
+        "RRG 动能 + EMA20 + 5D/20D 二级市场量能；ETF 如有官方 5D 份额流则参与确认，量能不等于净申赎。")
+    if ambush_candidates:
+        st.success(f"🎯 检测到黄金埋伏标的: {'、'.join(ambush_candidates)}（动能反转 + 量能/官方流量确认；仅为观察候选，非买入指令）")
+    else:
+        st.info("🎯 黄金埋伏池：当前主题暂无同时满足动能反转、均线收复与参与度扩大的标的。")
+    if climax_candidates:
+        st.warning(f"⚠️ 动能衰竭预警: {'、'.join(climax_candidates)}（Leading 象限动能回落或 X>105；谨防追高及短线回踩）")
+    else:
+        st.caption("⚠️ 当前主题未触发 Leading 象限动能衰竭条件。")
     col_left, col_right = st.columns(2, gap="medium")
     with col_left:
         section_header("PRICE RRG", f"价格动能旋转图 · {selected_theme}", f"相对 {rrg_benchmark}；末端为最新交易日，尾迹长度由侧边栏控制。")
@@ -1990,11 +2044,7 @@ with tab_rotation:
     rs_fig.update_yaxes(title="Relative Performance · Rebased 100")
     st.plotly_chart(rs_fig,use_container_width=True,config={"displaylogo":False})
 
-    section_header("TACTICAL STOCK RADAR",f"个股多空强弱与异常量能 · {selected_theme}",f"价格、相对 {rrg_benchmark} 均线结构与 20 日相对量比；可按动能或 RVOL 快速排序。")
-    try:
-        theme_ohlcv=load_ohlcv(tuple(selected_rrg_tickers),"1y")
-    except Exception:
-        theme_ohlcv=pd.DataFrame()
+    section_header("TACTICAL STOCK RADAR",f"个股多空强弱与异常量能 · {selected_theme}",f"价格、相对 {rrg_benchmark} 均线、量比、成交金额与近期放量日锚定 VWAP；成交金额不是净流入。")
     tactical=theme_tactical_scoreboard(prices,theme_ohlcv,selected_rrg_tickers,rrg_benchmark)
     tactical_sort=st.radio("战术排序",["动能强 → 弱","RVOL 高 → 低","观测池顺序"],horizontal=True,key="theme_tactical_sort")
     if tactical.empty:
@@ -2007,7 +2057,7 @@ with tab_rotation:
             tactical=tactical.assign(_order=tactical["Ticker"].str.split(" · ").str[0].map(order)).sort_values("_order").drop(columns="_order")
         tactical_display=tactical.drop(columns=["_MomentumScore","_RVOL"])
         tactical_style=tactical_display.style.map(
-            lambda value:"background-color:rgba(246,196,83,.16);color:#f6c453;font-weight:700" if "异常放量" in str(value) else "",
+            lambda value:"background-color:rgba(246,196,83,.16);color:#f6c453;font-weight:700" if "资金爆量" in str(value) else "",
             subset=["RVOL (20D)"])
         st.dataframe(tactical_style,use_container_width=True,hide_index=True,height=min(470,42+36*len(tactical_display)))
 
@@ -2742,7 +2792,7 @@ with tab_options:
 with tab_flow:
     flow_head,flow_control=st.columns([5,1.2],vertical_alignment="bottom")
     with flow_head:
-        section_header("PRIMARY MARKET FLOW","08 ETF 一级市场份额追踪","TQQQ / SOXL 杠杆资金与 QQQ / SPY 基石资本；Daily Flow = ΔShares × Prior NAV。")
+        section_header("PRIMARY MARKET FLOW","08 ETF 一级市场份额追踪","TQQQ / SOXL、QQQ / SPY 及 SOXX / SMH；仅相邻发行商份额记录可计算 Daily Flow = ΔShares × Prior NAV。")
     with flow_control:
         flow_symbol=st.selectbox("ETF 选择器",list(PRIMARY_FLOW_ETFS),key="leveraged_flow_symbol",
             format_func=lambda value:PRIMARY_FLOW_ETFS[value]["label"])
@@ -2762,30 +2812,36 @@ with tab_flow:
         record_count=int(flow_frame["RecordCount"].iloc[-1]) if "RecordCount" in flow_frame else 0
         window=valid_flow.tail(60); close_low=float(window["Close"].min()); close_high=float(window["Close"].max())
         price_low_zone=float(window["Close"].iloc[-1])<=close_low+.20*max(close_high-close_low,0)
-        latest_is_official=bool(window["HasOfficialRecord"].iloc[-1]) if "HasOfficialRecord" in window else False
+        latest_is_official=bool(window["HasVerifiedFlow"].iloc[-1]) if "HasVerifiedFlow" in window else False
         flow_new_high=latest_flow>0 and latest_flow>=float(window["DailyFlow"].max())
         divergence=verified_shares and latest_is_official and price_low_zone and flow_new_high
         def compact_dollar(value: float) -> str:
             if not np.isfinite(value): return "N/A"
             return f"${value/1e9:+,.2f}B" if abs(value)>=1e9 else f"${value/1e6:+,.1f}M"
         flow_cards=st.columns(4)
-        flow_cards[0].metric("LATEST VERIFIED FLOW",compact_dollar(latest_flow) if verified_shares else "N/A")
-        flow_cards[1].metric("60D MAX INFLOW",compact_dollar(float(window["DailyFlow"].max())) if verified_shares else "N/A")
+        has_verified_flow=bool(window["HasVerifiedFlow"].iloc[-1]) if "HasVerifiedFlow" in window else False
+        any_verified_flow=bool(window["HasVerifiedFlow"].any()) if "HasVerifiedFlow" in window else False
+        flow_cards[0].metric("LATEST VERIFIED FLOW",compact_dollar(latest_flow) if has_verified_flow else "待连续披露")
+        flow_cards[1].metric("60D MAX INFLOW",compact_dollar(float(window["DailyFlow"].max())) if any_verified_flow else "待连续披露")
         flow_cards[2].metric("PRICE · 60D POSITION",f"${window['Close'].iloc[-1]:,.2f}","LOW ZONE" if price_low_zone else "MID / HIGH RANGE",delta_color="off")
         flow_cards[3].metric("DIVERGENCE","🔥 极端底背离·吸筹确认" if divergence else "NO CONFIRMATION",delta_color="off")
         if verified_shares:
             asof_text=official_asof.strftime("%Y-%m-%d") if pd.notna(official_asof) else "N/A"
             st.success(f"数据层：{flow_source} · 份额/NAV 截至 {asof_text} · {record_count:,} 条有效记录 · {logger_status}。未发布日期固定为 $0。")
+            if not any_verified_flow:
+                st.warning("尚无相邻交易日的发行商份额记录：资金柱为占位零值，不代表已确认零净申赎。价格与已公布 NAV 仍可观察。")
         else:
-            st.info(f"{flow_symbol} 尚无可验证的 Shares Outstanding 记录（{logger_status}）；流量柱严格保持 $0，仅展示市场价格，不进行任何成交量代理。")
+            st.warning(f"{flow_symbol} 尚无可核实的发行商份额/NAV 日度记录；资金柱为占位零值，不能推断一级市场净申赎。")
         flow_fig=make_subplots(specs=[[{"secondary_y":True}]])
         scale=1e9 if max(float(flow_frame["DailyFlow"].abs().max()),extreme_threshold)>=1e9 else 1e6
         unit="B" if scale==1e9 else "M"; flow_scaled=flow_frame["DailyFlow"]/scale; threshold_scaled=extreme_threshold/scale
         bar_colors=np.where(flow_frame["DailyFlow"]>=extreme_threshold,"#f6c453",
             np.where(flow_frame["DailyFlow"]<=-extreme_threshold,"#ff365f",
                      np.where(flow_frame["DailyFlow"]>=0,"#31d6a0","#b9435a")))
-        flow_fig.add_trace(go.Bar(x=flow_frame.index,y=flow_scaled,name="Verified Daily Primary Flow",marker_color=bar_colors,
-            hovertemplate=f"%{{x|%Y-%m-%d}}<br>Flow $%{{y:+,.2f}}{unit}<extra></extra>"),secondary_y=False)
+        flow_status=np.where(flow_frame["HasVerifiedFlow"],"相邻官方份额已核实","份额缺失 · 占位零值")
+        flow_fig.add_trace(go.Bar(x=flow_frame.index,y=flow_scaled,name="Primary Flow (unverified dates = 0)",
+            marker_color=bar_colors,customdata=flow_status,
+            hovertemplate=f"%{{x|%Y-%m-%d}}<br>Flow $%{{y:+,.2f}}{unit}<br>%{{customdata}}<extra></extra>"),secondary_y=False)
         flow_fig.add_trace(go.Scatter(x=flow_frame.index,y=flow_frame["Close"],name=f"{flow_symbol} Close",
             line=dict(color="#5aa2ff",width=2.2),hovertemplate="%{x|%Y-%m-%d}<br>Close $%{y:.2f}<extra></extra>"),secondary_y=True)
         if "NAV" in flow_frame and flow_frame["NAV"].notna().any():
@@ -2808,7 +2864,7 @@ with tab_flow:
         flow_fig.update_yaxes(title=f"Verified Creation / Redemption · ${unit}",secondary_y=False)
         flow_fig.update_yaxes(title="NAV / Adjusted Close",secondary_y=True)
         st.plotly_chart(flow_fig,use_container_width=True,config={"displaylogo":False,"scrollZoom":True})
-        st.caption(f"严格口径：仅使用已记录的 Shares Outstanding 与 NAV；无记录或接口失败日期流量为 0。{flow_meta['class']} 极端阈值 {threshold_label}。成交量、涨跌幅与 signed-dollar-volume 均不参与计算。")
+        st.caption(f"严格口径：仅使用相邻日期已记录的 Shares Outstanding 与前日 NAV；无记录或接口失败日期显示占位 0，不可解释为真实零净申赎。{flow_meta['class']} 极端阈值 {threshold_label}。成交量、涨跌幅与 signed-dollar-volume 均不参与计算。")
 
 with tab_circuit:
     section_header("SYSTEMIC RISK LOCKS","Circuit Breakers · 宏观与系统风控","三把安全锁：指数200SMA、信用风险偏好、VIX期限结构。")
