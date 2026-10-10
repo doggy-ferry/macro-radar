@@ -84,6 +84,22 @@ def xlsx_rows(payload: bytes) -> list[list[object]]:
 
 
 def issuer_records(symbol: str) -> pd.DataFrame:
+    if symbol == "SOXX":
+        url = "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf"
+        page = html.unescape(get(url).decode("utf-8", errors="replace"))
+        share_match = re.search(r'"sharesOutstanding":(\{[^{}]*\})', page)
+        nav_match = re.search(r'"name":"NAV as of","value":"([\d,.]+)"[^{}]*"valueReference":\{[^{}]*"value":"([^"]+)"', page)
+        if not share_match or not nav_match:
+            return pd.DataFrame(columns=FLOW_COLUMNS)
+        share_data = json.loads(share_match.group(1))
+        share_date = pd.to_datetime(share_data.get("formattedAsOfDate"), errors="coerce")
+        nav_date = pd.to_datetime(nav_match.group(2), errors="coerce")
+        if pd.isna(share_date) or pd.isna(nav_date) or share_date.normalize() != nav_date.normalize():
+            return pd.DataFrame(columns=FLOW_COLUMNS)
+        shares = str(share_data.get("formattedValue", "")).replace(",", "")
+        nav = nav_match.group(1).replace(",", "")
+        return normalize(pd.DataFrame([{"date": share_date, "shares_outstanding": shares,
+            "nav": nav, "source_url": url, "source_note": "iShares official SOXX shares and NAV"}]))
     if symbol in SECTOR_SHARE_SYMBOLS:
         url = f"https://www.ssga.com/library-content/products/fund-data/etfs/us/navhist-us-en-{symbol.lower()}.xlsx"
         rows = xlsx_rows(get(url))
@@ -238,7 +254,7 @@ def save_options() -> None:
 
 
 if __name__ == "__main__":
-    for ticker_symbol in (*SECTOR_SHARE_SYMBOLS, "TQQQ", "SOXL", "QQQ", "SPY"):
+    for ticker_symbol in (*SECTOR_SHARE_SYMBOLS, "SOXX", "TQQQ", "SOXL", "QQQ", "SPY"):
         try:
             save_issuer_history(ticker_symbol)
         except Exception as error:
