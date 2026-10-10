@@ -26,6 +26,7 @@ DATA.mkdir(exist_ok=True)
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; BuySideQuantPortal/1.0)"}
 FLOW_COLUMNS = ["date", "shares_outstanding", "nav", "source_url", "source_note"]
 OPTION_SYMBOLS = ("QQQ", "SPY", "SMH", "SOXX", "NVDA", "TSLA", "MU", "ITA", "XLE")
+SECTOR_SHARE_SYMBOLS = ("XLK", "XLE", "XLF", "XLI", "XLY", "XLC", "XLV", "XLP", "XLU", "XLRE", "XLB")
 OPTION_COLUMNS = ["Symbol", "SnapshotAtUTC", "SpotAtCapture", "Expiration", "Type",
                   "contractSymbol", "strike", "lastPrice", "bid", "ask", "volume",
                   "openInterest", "impliedVolatility", "inTheMoney"]
@@ -83,6 +84,22 @@ def xlsx_rows(payload: bytes) -> list[list[object]]:
 
 
 def issuer_records(symbol: str) -> pd.DataFrame:
+    if symbol in SECTOR_SHARE_SYMBOLS:
+        url = f"https://www.ssga.com/library-content/products/fund-data/etfs/us/navhist-us-en-{symbol.lower()}.xlsx"
+        rows = xlsx_rows(get(url))
+        index = next((i for i, row in enumerate(rows)
+            if any(str(item).strip().lower() == "date" for item in row if item is not None)), None)
+        if index is None:
+            return pd.DataFrame(columns=FLOW_COLUMNS)
+        header = [str(item).strip() if item is not None else "" for item in rows[index]]
+        raw = pd.DataFrame(rows[index + 1:]).iloc[:, :len(header)]
+        raw.columns = header[:len(raw.columns)]
+        if not {"Date", "Shares Outstanding", "NAV"}.issubset(raw.columns):
+            return pd.DataFrame(columns=FLOW_COLUMNS)
+        return normalize(pd.DataFrame({"date": raw["Date"],
+            "shares_outstanding": pd.to_numeric(raw["Shares Outstanding"], errors="coerce"),
+            "nav": pd.to_numeric(raw["NAV"], errors="coerce"),
+            "source_url": url, "source_note": "State Street official daily NAV/share history"})).tail(300)
     if symbol == "TQQQ":
         url = "https://accounts.profunds.com/etfdata/ByFund/TQQQ-historical_nav.csv"
         raw = pd.read_csv(StringIO(get(url).decode("utf-8-sig", errors="replace")))
@@ -155,6 +172,8 @@ def save_issuer_history(symbol: str) -> None:
         return
     prior = normalize(existing)
     combined = normalize(pd.concat([prior, incoming], ignore_index=True))
+    if symbol in SECTOR_SHARE_SYMBOLS:
+        combined = combined.tail(300).reset_index(drop=True)
     if not combined.equals(prior):
         combined.to_csv(path, index=False)
     print(f"{symbol}: {len(incoming)} verified observations, {len(combined)} retained")
@@ -219,7 +238,7 @@ def save_options() -> None:
 
 
 if __name__ == "__main__":
-    for ticker_symbol in ("TQQQ", "SOXL", "QQQ", "SPY"):
+    for ticker_symbol in (*SECTOR_SHARE_SYMBOLS, "TQQQ", "SOXL", "QQQ", "SPY"):
         try:
             save_issuer_history(ticker_symbol)
         except Exception as error:

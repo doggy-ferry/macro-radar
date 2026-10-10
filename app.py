@@ -24,6 +24,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
 from ui_theme import inject_theme, apply_quant_theme
+from dual_rrg import FLOW_TICKERS, build_flow_rrg, flow_quadrant, convergence_label
 
 try:
     from scipy.signal import argrelextrema
@@ -95,7 +96,7 @@ SECTORS = {
     "XLU": ("Utilities", "公用事业", 2.4), "XLRE": ("Real Estate", "房地产", 2.0),
     "XLB": ("Materials", "原材料", 2.2),
 }
-RRG_EXTRA = {"SMH": "Semiconductors · 半导体", "GLD": "Gold · 黄金"}
+RRG_EXTRA = {"SMH": "Semiconductors · 半导体", "SOXX": "Semiconductors · 芯片", "GLD": "Gold · 黄金"}
 COMMODITIES = {"GLD": "黄金", "SLV": "白银", "USO": "原油", "CPER": "铜", "UUP": "美元指数", "TLT": "20年+美债"}
 
 # Representative S&P weights for heat-map area only; all price/return data are live.
@@ -148,7 +149,7 @@ PERIOD_BARS = {"1M":21,"3M":63,"6M":126,"YTD":None,"1Y":252,"3Y":756,"5Y":1260,"
 REGIME_PAIRS = {"QQQ / TQQQ":("QQQ","TQQQ"),"SPY / SPXL":("SPY","SPXL"),
                 "SOXX / SOXL":("SOXX","SOXL"),"XLK / TECL":("XLK","TECL")}
 AI_THEMES = {
-    "宏观 11 大行业 ETF": ["XLK","XLE","XLI","XLY","XLC","XLF","XLV","XLP","XLU","XLRE","XLB","SMH"],
+    "宏观 11 大行业 ETF": ["XLK","XLE","XLI","XLY","XLC","XLF","XLV","XLP","XLU","XLRE","XLB","SMH","SOXX"],
     "AI 算力与半导体龙头": ["NVDA","AMD","TSM","AVGO","ASML","MU"],
     "AI 物理基建 (电力/核能/液冷)": ["VST","CEG","CCJ","OKLO","VRT","ETN"],
     "关键资源与地缘避险": ["FCX","CPER","LMT","RTX","ITA","XLE"],
@@ -170,7 +171,7 @@ PRIMARY_FLOW_ETFS = {
 COLORS = {
     "XLK": "#40c4ff", "XLC": "#8b7cff", "XLY": "#ff8f5a", "XLI": "#b7c5d8", "XLE": "#00d7a3",
     "XLF": "#3a86ff", "XLV": "#ff4d76", "XLP": "#e6c85c", "XLU": "#5c7cfa", "XLRE": "#b985ff",
-    "XLB": "#8bcf74", "SMH": "#ff3e68", "GLD": "#f3c94f", "SLV": "#c6d0dc", "USO": "#f26d4b",
+    "XLB": "#8bcf74", "SMH": "#ff3e68", "SOXX": "#f472b6", "GLD": "#f3c94f", "SLV": "#c6d0dc", "USO": "#f26d4b",
     "CPER": "#d99152", "UUP": "#38bdf8", "TLT": "#a78bfa", "QQQ": "#ff8a3d",
 }
 with st.sidebar:
@@ -751,6 +752,52 @@ def _xlsx_first_sheet(payload: bytes) -> list[list[object]]:
                 values[column-1]=value
             rows.append(values)
         return rows
+
+
+def _state_street_share_history(symbol: str) -> pd.DataFrame:
+    """Parse an issuer NAV-history workbook; reject missing share/date columns."""
+    url=f"https://www.ssga.com/library-content/products/fund-data/etfs/us/navhist-us-en-{symbol.lower()}.xlsx"
+    response=requests.get(url,headers={"User-Agent":"Mozilla/5.0","Accept":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*"},timeout=18)
+    response.raise_for_status()
+    rows=_xlsx_first_sheet(response.content)
+    header_index=next((index for index,row in enumerate(rows)
+        if any(str(item).strip().lower()=="date" for item in row if item is not None)),None)
+    if header_index is None:
+        return pd.DataFrame(columns=FLOW_RECORD_COLUMNS)
+    headers=[str(value).strip() if value is not None else "" for value in rows[header_index]]
+    frame=pd.DataFrame(rows[header_index+1:])
+    frame=frame.iloc[:,:len(headers)]
+    frame.columns=headers[:len(frame.columns)]
+    lookup={re.sub(r"[^a-z]","",column.lower()):column for column in frame.columns}
+    date_col=lookup.get("date")
+    shares_col=next((value for key,value in lookup.items() if "sharesoutstanding" in key),None)
+    nav_col=lookup.get("nav")
+    if not date_col or not shares_col or not nav_col:
+        return pd.DataFrame(columns=FLOW_RECORD_COLUMNS)
+    date_values=frame[date_col]
+    numeric=pd.to_numeric(date_values,errors="coerce")
+    parsed=pd.to_datetime(date_values.where(numeric.isna()),errors="coerce")
+    parsed=parsed.fillna(pd.to_datetime(numeric,unit="D",origin="1899-12-30",errors="coerce"))
+    return _normalise_flow_records(pd.DataFrame({"date":parsed,
+        "shares_outstanding":pd.to_numeric(frame[shares_col].astype(str).str.replace(",","",regex=False),errors="coerce"),
+        "nav":pd.to_numeric(frame[nav_col].astype(str).str.replace(",","",regex=False),errors="coerce"),
+        "source_url":url,"source_note":"State Street official daily NAV/share history"}))
+
+
+@st.cache_data(ttl=900,show_spinner=False)
+def load_dual_rrg_share_records() -> dict[str,pd.DataFrame]:
+    """Issuer observations only; local snapshots survive issuer outages."""
+    output={ticker:_read_baseline_records(ticker) for ticker in FLOW_TICKERS}
+    def fetch(ticker: str) -> tuple[str,pd.DataFrame]:
+        try:
+            return ticker,_state_street_share_history(ticker)
+        except Exception:
+            return ticker,pd.DataFrame(columns=FLOW_RECORD_COLUMNS)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for ticker,incoming in pool.map(fetch,SECTORS):
+            if not incoming.empty:
+                output[ticker]=_normalise_flow_records(pd.concat([output[ticker],incoming],ignore_index=True))
+    return output
 
 
 def _deep_find_number(obj: object, names: set[str]) -> float:
@@ -1765,12 +1812,35 @@ with tab_briefing:
 with tab_rotation:
     rotation_head,rotation_control,benchmark_control=st.columns([4.6,1.75,1.0],vertical_alignment="bottom")
     with rotation_head:
-        section_header("MULTI-ASSET ROTATION","01 Sector & AI Themes RRG · 个股主题下钻","行业、AI 基建与地缘主题的相对旋转、量能和期权战术共振。")
+        section_header("DUAL-RRG CONVERGENCE","01 Sector & Themes · 双轨动能与资金流共振","左屏价格旋转；右屏仅采用发行商已公布份额计算一级市场净申赎。")
     with rotation_control:
         selected_theme=st.selectbox("Theme 观测池",list(AI_THEMES),key="rrg_theme_selector")
     with benchmark_control:
         rrg_benchmark=st.selectbox("RRG Benchmark",["QQQ","SPY"],key="rrg_benchmark")
     selected_rrg_tickers=AI_THEMES[selected_theme]
+    verified_shares=load_dual_rrg_share_records()
+    flow_trails,flow_five_day=build_flow_rrg(prices,verified_shares)
+    price_quadrants={}
+    for ticker in FLOW_TICKERS:
+        if ticker in prices and rrg_benchmark in prices:
+            frame=rrg_frame(prices[ticker],prices[rrg_benchmark])
+            if not frame.empty:
+                last=frame.iloc[-1]
+                price_quadrants[ticker]=flow_quadrant(float(last["rs_ratio"]),float(last["rs_momentum"]))
+    convergence_rows=[]
+    for ticker in FLOW_TICKERS:
+        tail=flow_trails.get(ticker)
+        flow_zone=flow_quadrant(float(tail["flow_ratio"].iloc[-1]),float(tail["flow_momentum"].iloc[-1])) if tail is not None else "N/A"
+        price_zone=price_quadrants.get(ticker,"N/A")
+        five_day=flow_five_day.get(ticker,np.nan)
+        close=prices[ticker].dropna() if ticker in prices else pd.Series(dtype=float)
+        convergence_rows.append({"板块":ticker,"现价":float(close.iloc[-1]) if not close.empty else np.nan,
+            "价格象限":price_zone,"资金象限":flow_zone,"5D累计净申赎 ($M)":five_day/1e6 if np.isfinite(five_day) else np.nan,
+            "系统判定":convergence_label(price_zone,flow_zone,five_day)})
+    convergence=pd.DataFrame(convergence_rows)
+    early=convergence.loc[convergence["系统判定"].eq("🔥 机构抢跑起爆"),"板块"].tolist()
+    traps=convergence.loc[convergence["系统判定"].eq("⚠️ 缩量虚火诱多"),"板块"].tolist()
+    st.info(f"🔥 机构抢跑：{'、'.join(early) or '暂无已核实信号'}　｜　⚠️ 价格领先但资金背离：{'、'.join(traps) or '暂无已核实信号'}　｜　资金轨迹覆盖 {len(flow_trails)}/{len(FLOW_TICKERS)} 只 ETF")
     theme_crossovers=rrg_improving_crossovers(prices,selected_rrg_tickers,rrg_benchmark)
     if theme_crossovers:
         st.success(f"🎯 弱转强自动诊断：{'、'.join(theme_crossovers)} 最近3日由 Lagging 跨入 Improving。")
@@ -1778,7 +1848,7 @@ with tab_rotation:
         st.info("弱转强自动诊断：当前主题暂无 Lagging → Improving 的三日确认信号。")
     col_left, col_right = st.columns(2, gap="medium")
     with col_left:
-        section_header("RELATIVE ROTATION", f"RRG · {selected_theme}", f"相对 {rrg_benchmark}；末端为最新交易日，尾迹长度由侧边栏控制。")
+        section_header("PRICE RRG", f"价格动能旋转图 · {selected_theme}", f"相对 {rrg_benchmark}；末端为最新交易日，尾迹长度由侧边栏控制。")
         fig, tails = go.Figure(), []
         rrg_names = {ticker:(SECTORS[ticker][1] if ticker in SECTORS else TACTICAL_NAMES.get(ticker,RRG_EXTRA.get(ticker,ticker))) for ticker in selected_rrg_tickers}
         palette=px.colors.qualitative.Bold+px.colors.qualitative.Safe
@@ -1809,51 +1879,46 @@ with tab_rotation:
         fig.update_xaxes(title="RS-Ratio", range=xr); fig.update_yaxes(title="RS-Momentum", range=yr)
         st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
     with col_right:
-        section_header("RELATIVE STRENGTH", f"Theme RS vs {rrg_benchmark} · 主题相对强弱", "当前观测池比率在观察期起点归一至 100；点线为 200 日平滑。")
-        fig = go.Figure()
-        for index,ticker in enumerate(selected_rrg_tickers):
-            pair = prices[[ticker,rrg_benchmark]].dropna() if ticker in prices else pd.DataFrame()
-            if pair.empty: continue
-            ratio_full = pair[ticker].div(pair[rrg_benchmark])
-            ratio = display_window(ratio_full,rs_horizon)
-            if ratio.empty: continue
-            rebased = ratio.div(ratio.iloc[0]).mul(100); color = COLORS.get(ticker,palette[index%len(palette)])
-            label=rrg_names.get(ticker,ticker)
-            fig.add_trace(go.Scatter(x=rebased.index, y=rebased, mode="lines", name=ticker, line=dict(color=color, width=1.45),
-                hovertemplate=f"<b>{ticker} · {label}</b><br>%{{x|%Y-%m-%d}}<br>RS %{{y:.2f}}<extra></extra>"))
-            # Calculate the true 200-day smoother before clipping to the display horizon.
-            smooth_full = ratio_full.rolling(200,min_periods=200).mean().div(ratio.iloc[0]).mul(100)
-            smooth = display_window(smooth_full,rs_horizon)
-            fig.add_trace(go.Scatter(x=smooth.index, y=smooth, mode="lines", name=f"{ticker} 200D", showlegend=False, line=dict(color=color, width=.75, dash="dot"), hoverinfo="skip"))
-        benchmark_anchor=display_window(prices[rrg_benchmark].dropna(),rs_horizon)
-        if not benchmark_anchor.empty:
-            fig.add_trace(go.Scatter(x=benchmark_anchor.index,y=np.full(len(benchmark_anchor),100.0),name=f"{rrg_benchmark} ANCHOR",
-                line=dict(color="#edf2f7",width=1.8,dash="dash"),hovertemplate=f"<b>{rrg_benchmark} Anchor</b><br>%{{x|%Y-%m-%d}}<br>100.00<extra></extra>"))
-        base_layout(fig, 570, "x unified"); fig.add_hline(y=100, line_dash="dash", line_color="#728198", line_width=1)
-        fig.update_xaxes(title=None); fig.update_yaxes(title="Relative Performance · Rebased 100")
-        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
-        flow_scores={}
-        for ticker in SECTORS:
-            if ticker in sector_flow_close and ticker in sector_flow_volume:
-                score=signed_flow_score(sector_flow_close[ticker],sector_flow_volume[ticker])
-                if np.isfinite(score): flow_scores[ticker]=score
-        inflow=sorted(flow_scores,key=flow_scores.get,reverse=True)[:3]
-        outflow=sorted(flow_scores,key=flow_scores.get)[:3]
-        strong=[]; weak=[]
-        for ticker in SECTORS:
-            _,stats=relative_signal(prices[ticker],prices["SPY"])
-            if stats.get("state") in {"强势 · 持有观察","过热 · 考虑减仓"}: strong.append(ticker)
-            if "潜伏" in str(stats.get("state","")): weak.append(ticker)
-        market_state,market_drivers,_=market_sentiment(prices)
-        inflow_text="、".join(f"{t}({flow_scores[t]:+.1f}%)" for t in inflow) or "数据不足"
-        outflow_text="、".join(f"{t}({flow_scores[t]:+.1f}%)" for t in outflow) or "数据不足"
-        st.markdown(f"""<div style="border:1px solid #24354d;background:#0a111c;padding:12px 14px;border-radius:4px;color:#aebdd0;font-size:.78rem;line-height:1.65">
-        <b style="color:#f0a13a">DAILY RELATIVE-STRENGTH READOUT</b><br>
-        市场状态：<b style="color:#eaf1fb">{market_state}</b>。SPY 500公司广度为 {sp_adv} 涨 / {sp_dec} 跌 / {sp_unch} 平（缺失 {sp_missing}）。<br>
-        跨资产驱动：<span style="color:#8191a6">{market_drivers or '数据不足'}</span>。<br>
-        相对 SPY 位于 60/200MA 上方：<b>{'、'.join(strong) or '暂无'}</b>；潜伏观察：<b>{'、'.join(weak) or '暂无'}</b>。<br>
-        20日成交金额方向代理净流入领先：<span style="color:#31d6a0">{inflow_text}</span>；净流出领先：<span style="color:#ff5874">{outflow_text}</span>。<br>
-        <span style="color:#65768d">资金方向为 signed-dollar-volume 代理，并非 ETF 真实申赎。</span></div>""",unsafe_allow_html=True)
+        section_header("FLOW RRG", "资金流渗透旋转图 · 11行业 + SMH/SOXX", "20D 净申赎 / AUM 横截面标准化；5D 加速度；仅采用连续披露的官方份额。")
+        flow_fig=go.Figure()
+        flow_tails=[]
+        for index,ticker in enumerate(FLOW_TICKERS):
+            tail=flow_trails.get(ticker)
+            if tail is None: continue
+            flow_tails.append(tail)
+            color=COLORS.get(ticker,palette[index%len(palette)])
+            flow_fig.add_trace(go.Scatter(x=tail["flow_ratio"],y=tail["flow_momentum"],mode="lines+markers",name=ticker,
+                showlegend=False,line=dict(color=color,width=1.8),
+                marker=dict(color=color,size=np.linspace(3.5,8.5,len(tail)),opacity=np.linspace(.3,1,len(tail)),line=dict(color="#e9f1fb",width=.35)),
+                customdata=tail.index.strftime("%Y-%m-%d"),
+                hovertemplate=f"<b>{ticker}</b><br>%{{customdata}}<br>Flow-Ratio %{{x:.2f}}<br>Flow-Momentum %{{y:.2f}}<extra></extra>"))
+            last=tail.iloc[-1]
+            flow_fig.add_annotation(x=float(last["flow_ratio"]),y=float(last["flow_momentum"]),text=f"<b>{ticker}</b>",showarrow=True,
+                arrowhead=2,arrowsize=.9,arrowwidth=1.2,arrowcolor=color,ax=13,ay=-13,font=dict(color=color,size=9),
+                bgcolor="rgba(5,9,15,.82)",bordercolor=color,borderwidth=.8,borderpad=2)
+        if flow_tails:
+            all_x=pd.concat([tail["flow_ratio"] for tail in flow_tails]); all_y=pd.concat([tail["flow_momentum"] for tail in flow_tails])
+            x_pad=max(.8,float(all_x.max()-all_x.min())*.15); y_pad=max(.8,float(all_y.max()-all_y.min())*.15)
+            flow_x=[min(99,float(all_x.min())-x_pad),max(101,float(all_x.max())+x_pad)]
+            flow_y=[min(99,float(all_y.min())-y_pad),max(101,float(all_y.max())+y_pad)]
+        else:
+            flow_x,flow_y=[98,102],[98,102]
+        base_layout(flow_fig,570)
+        flow_fig.add_vline(x=100,line_dash="dash",line_color="#71829a",line_width=1)
+        flow_fig.add_hline(y=100,line_dash="dash",line_color="#71829a",line_width=1)
+        for x,y,label,color,anchor in [(.02,.97,"IMPROVING · 暗涌抢筹","#21d9a3","left"),(.98,.97,"LEADING · 机构主买","#ff5874","right"),
+                                        (.02,.03,"LAGGING · 资金失血","#718cff","left"),(.98,.03,"WEAKENING · 流入减速","#e5c34d","right")]:
+            flow_fig.add_annotation(xref="paper",yref="paper",x=x,y=y,text=f"<b>{label}</b>",showarrow=False,xanchor=anchor,font=dict(color=color,size=9))
+        flow_fig.update_xaxes(title="Flow-Intensity Ratio",range=flow_x)
+        flow_fig.update_yaxes(title="Flow-Velocity Momentum",range=flow_y)
+        st.plotly_chart(flow_fig,use_container_width=True,config={"displaylogo":False})
+        if not flow_tails:
+            st.caption("尚无足够的连续官方份额记录生成 20D 强度与 5D 轨迹。缺失不会被价格或成交量代理填补。")
+
+    section_header("CONVERGENCE MATRIX","双轨量价共振矩阵雷达","金额单位 $M；N/A 表示缺少连续发行商份额，不能推断真实净申赎。")
+    st.dataframe(convergence.style.format({"现价":"${:,.2f}","5D累计净申赎 ($M)":"{:+,.1f}"},na_rep="—"),
+                 use_container_width=True,hide_index=True,height=500)
+    st.caption("资金流 = 相邻官方份额变动 × 前一交易日收盘价；未披露日不补零、不将二级市场成交量伪装成一级市场资金。")
 
     section_header("TACTICAL STOCK RADAR",f"个股多空强弱与异常量能 · {selected_theme}",f"价格、相对 {rrg_benchmark} 均线结构与 20 日相对量比；可按动能或 RVOL 快速排序。")
     try:
