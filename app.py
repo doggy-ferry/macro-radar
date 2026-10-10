@@ -27,6 +27,7 @@ from ui_theme import inject_theme, apply_quant_theme
 from dual_rrg import FLOW_TICKERS, build_flow_rrg, flow_quadrant, convergence_label
 from sector_options import sector_option_signal
 from tactical_signals import participation_metrics, early_rrg_signals
+from trend_attribution import sma_slope_panel, slope_statistics, slope_regime, beta_return_decomposition
 
 try:
     from scipy.signal import argrelextrema
@@ -276,6 +277,16 @@ def load_custom_prices(tickers: tuple[str, ...], period: str) -> pd.DataFrame:
         close = close.to_frame(tickers[0])
     close.index = pd.to_datetime(close.index).tz_localize(None)
     return close.reindex(columns=list(tickers)).apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).sort_index()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_sma_slope_panel(close: pd.Series) -> pd.DataFrame:
+    return sma_slope_panel(close)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_beta_decomposition(target: pd.Series, market: pd.Series) -> dict[str, float] | None:
+    return beta_return_decomposition(target, market)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -2406,6 +2417,110 @@ with tab_technical:
                 <div style="margin-top:8px">当前 {numerator}/{denominator}：<b>{ratio_stats['state']}</b>，相对60MA {ratio_stats['vs_ma60']:+.2f}%，相对200MA {ratio_stats['vs_ma200']:+.2f}%。</div>
                 <div style="margin-top:8px;color:#8191a6">驱动：{drivers or '数据不足'}</div>
                 <div style="margin-top:8px;color:#65768d">分数 {sentiment_score:+d}；正值偏风险偏好，负值偏避险。锚定曲线用于横向比较，不代表绝对估值。</div></div>""",unsafe_allow_html=True)
+
+    st.divider()
+    slope_head,slope_control,slope_range=st.columns([4.2,1.25,1.0],vertical_alignment="bottom")
+    with slope_head:
+        section_header("SMA SLOPES","均線斜率動能儀 · SMA Slopes",
+            "完整歷史先計算 20/50/200DMA；斜率 = (MA 今日 − MA 五日前) / (5 × MA 五日前) × 100%，單位 %/交易日。")
+    with slope_control:
+        slope_choice=st.selectbox("Slope Ticker",["QQQ","SPY","SMH","SOXX","IWM","自訂代碼"],key="sma_slope_ticker")
+    with slope_range:
+        slope_period=st.selectbox("Chart Range",["6M","1Y","3Y","5Y","MAX"],index=2,key="sma_slope_range")
+    slope_ticker=slope_choice
+    if slope_choice=="自訂代碼":
+        slope_ticker="".join(ch for ch in st.text_input("自訂均線標的",value="KWEB",key="sma_slope_custom").upper().strip().replace(".","-")
+                             if ch.isalnum() or ch in "-^=")[:15]
+    slope_close=prices[slope_ticker].dropna() if slope_ticker in prices else pd.Series(dtype=float)
+    if slope_ticker:
+        try:
+            slope_download=(ratio_data if slope_ticker in ratio_data else
+                            load_custom_prices((slope_ticker,),"max"))
+            if slope_ticker in slope_download and not slope_download[slope_ticker].dropna().empty:
+                slope_close=slope_download[slope_ticker].dropna().combine_first(slope_close).sort_index()
+        except Exception:
+            pass
+    if len(slope_close)<205:
+        st.info(f"{slope_ticker or '標的'} 有效收盤價不足 205 個交易日，暫無法計算 200DMA 的 5 日斜率。")
+    else:
+        slope_panel=cached_sma_slope_panel(slope_close)
+        slope_stats=slope_statistics(slope_panel)
+        slope_state=slope_regime(slope_panel)
+        if slope_state=="BULLISH_DIP":
+            st.success("🟢 趨勢多頭洗盤（長期均線仍向上、短期均線回落；Dip 觀察候選，非確定買點）")
+        elif slope_state=="SYSTEMIC_BREAK":
+            st.error("🚨 系統級趨勢破位（20/50/200DMA 斜率全負；研究風控標記：暫停新增槓桿多頭）")
+        elif slope_state=="INSUFFICIENT":
+            st.info("三條均線的斜率尚未全部形成。")
+        else:
+            st.info("⚪ 混合斜率狀態：尚未符合多頭洗盤或三線同步轉負規則。")
+        slope_plot=display_window(slope_panel,slope_period)
+        slope_fig=go.Figure()
+        for window,color in ((20,"#4f86d9"),(50,"#e56f24"),(200,"#ff5874")):
+            column=f"SMA{window} Slope"
+            slope_fig.add_trace(go.Scatter(x=slope_plot.index,y=slope_plot[column],name=f"{window}DMA Slope",
+                mode="lines",line=dict(color=color,width=2 if window==20 else 1.7),
+                hovertemplate=f"<b>{window}DMA</b><br>%{{x|%Y-%m-%d}}<br>%{{y:+.4f}}%/day<extra></extra>"))
+        base_layout(slope_fig,420,"x unified")
+        slope_fig.add_hline(y=0,line_dash="dash",line_color="#f3f5f9",line_width=1.3)
+        slope_fig.update_yaxes(title="Slope · % / trading day",ticksuffix="%")
+        slope_fig.update_xaxes(title=None)
+        st.plotly_chart(slope_fig,use_container_width=True,config={"displaylogo":False,"scrollZoom":True})
+        st.dataframe(slope_stats.style.format({"Current":"{:+.4f}%","Mean":"{:+.4f}%",
+            "Std":"{:.4f}%","Min":"{:+.4f}%","Max":"{:+.4f}%",
+            "% days negative":"{:.1f}%"},na_rep="—").map(color_return,subset=["Current","Mean","Min","Max"]),
+            use_container_width=True,hide_index=True,height=155)
+        st.caption(f"歷史分佈按 {slope_ticker} 全部有效資料計算，非只按圖表視窗；截至 {slope_panel.index[-1]:%Y-%m-%d}。斜率狀態是研究警報，不預測崩盤，也不控制真實交易權限。")
+
+    st.divider()
+    beta_head,beta_control=st.columns([4.2,1.15],vertical_alignment="bottom")
+    with beta_head:
+        section_header("BETA ATTRIBUTION","特異性 Beta 收益歸因器 · 1D Return Decomposition",
+            "以 SPY 為單一市場因子；最近 252 個共同交易日估計 Beta，當日收益拆為 Beta × SPY 漲跌與剩餘殘差。")
+    with beta_control:
+        beta_choice=st.selectbox("Target Ticker",["SMH","KWEB","BABA","SOXX","QQQ","NVDA","自訂代碼"],key="beta_target")
+    beta_ticker=beta_choice
+    if beta_choice=="自訂代碼":
+        beta_ticker="".join(ch for ch in st.text_input("自訂歸因標的",value="TSM",key="beta_custom").upper().strip().replace(".","-")
+                             if ch.isalnum() or ch in "-^=")[:15]
+    beta_target=prices[beta_ticker].dropna() if beta_ticker in prices else pd.Series(dtype=float)
+    if beta_ticker and len(beta_target)<253:
+        try:
+            beta_download=load_custom_prices((beta_ticker,),"max")
+            beta_target=beta_download[beta_ticker].dropna() if beta_ticker in beta_download else pd.Series(dtype=float)
+        except Exception:
+            beta_target=pd.Series(dtype=float)
+    beta_result=(cached_beta_decomposition(beta_target,prices["SPY"].dropna())
+                 if beta_ticker and beta_ticker!="SPY" and not beta_target.empty else None)
+    if beta_ticker=="SPY":
+        st.info("目標與市場基準同為 SPY；請選擇其他標的來觀察特異性殘差。")
+    elif beta_result is None:
+        st.info(f"{beta_ticker or '標的'} 與 SPY 尚無 252 個有效共同日回報，或基準波動為零；暫不顯示歸因。")
+    else:
+        latest_spy_session=prices["SPY"].dropna().index[-1]
+        if beta_result["asof"]<latest_spy_session:
+            st.warning(f"{beta_ticker} 最近共同有效收盤日為 {beta_result['asof']:%Y-%m-%d}，落後於 SPY；以下是該日歸因，不是今日信號。")
+        beta_cards=st.columns(4)
+        beta_cards[0].metric("TARGET 1D",f"{beta_result['target_1d']:+.2f}%")
+        beta_cards[1].metric("SPY 1D",f"{beta_result['market_1d']:+.2f}%")
+        beta_cards[2].metric("252D BETA",f"{beta_result['beta']:+.2f}",f"ρ {beta_result['correlation']:+.2f}",delta_color="off")
+        beta_cards[3].metric("SPECIFIC RESIDUAL",f"{beta_result['specific_pp']:+.2f} pp")
+        attribution_fig=go.Figure()
+        for name,value,color in (("Explained by SPY × Beta",beta_result["explained_pp"],"#4f86d9"),
+                                 ("Specific Remainder",beta_result["specific_pp"],"#f0a13a")):
+            attribution_fig.add_trace(go.Bar(x=[value],y=["當日收益"],orientation="h",name=name,
+                marker_color=color,text=[f"{value:+.2f} pp"],textposition="auto",
+                hovertemplate=f"<b>{name}</b><br>%{{x:+.3f}} percentage points<extra></extra>"))
+        attribution_fig.add_trace(go.Scatter(x=[beta_result["target_1d"]],y=["當日收益"],mode="markers",
+            name=f"Target total {beta_result['target_1d']:+.2f}%",marker=dict(color="#f4f6fb",size=13,symbol="diamond"),
+            hovertemplate="Target total %{x:+.3f}%<extra></extra>"))
+        base_layout(attribution_fig,295,"closest")
+        attribution_fig.update_layout(barmode="relative",title=dict(text=f"{beta_ticker} · {beta_result['asof']:%Y-%m-%d} · 1D Market vs Specific",font=dict(size=12,color="#f0a13a")))
+        attribution_fig.add_vline(x=0,line_dash="dash",line_color="#f3f5f9",line_width=1)
+        attribution_fig.update_xaxes(title="Return contribution · percentage points",ticksuffix=" pp")
+        attribution_fig.update_yaxes(title=None)
+        st.plotly_chart(attribution_fig,use_container_width=True,config={"displaylogo":False})
+        st.caption(f"恆等式：{beta_result['explained_pp']:+.2f} pp（市場） + {beta_result['specific_pp']:+.2f} pp（殘差） = {beta_result['target_1d']:+.2f}%（{beta_ticker} 當日）。殘差包含產業、匯率與個股等未建模因素；不是經風險調整後的 CAPM Alpha 或事件因果證明。")
 
     section_header("REGIME SCANNER", "Bottoming & Overheat Scanner · 见底与过热扫描", "规则：蓝线低于 60/200MA 为潜伏观察；Z≤−1.5 且 MACD 柱回升为见底候选；蓝线高于两线为持有，Z≥+2 为过热减仓。")
     scan_candidates = list(dict.fromkeys(list(SECTORS) + ["SMH","GLD","SLV","TLT","USO","CPER","QQQ","IWM"]
