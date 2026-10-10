@@ -37,7 +37,16 @@ def build_flow_rrg(prices: pd.DataFrame, share_records: dict[str, pd.DataFrame])
     """
     if prices.empty:
         return {}, {}
-    calendar = pd.DatetimeIndex(pd.to_datetime(prices.index).tz_localize(None)).normalize()
+    # The dashboard-wide Yahoo union may contain extra dates from non-US assets.
+    # Use the US equity session calendar, otherwise every issuer file can appear
+    # stale despite having the latest published sector-ETF observation.
+    anchor = "SPY" if "SPY" in prices else next((symbol for symbol in FLOW_TICKERS if symbol in prices), None)
+    if anchor is None:
+        return {}, {}
+    session_index = prices.index[pd.to_numeric(prices[anchor], errors="coerce").notna()]
+    calendar = pd.DatetimeIndex(pd.to_datetime(session_index).tz_localize(None)).normalize()
+    if calendar.empty:
+        return {}, {}
     intensity = pd.DataFrame(index=calendar, columns=FLOW_TICKERS, dtype=float)
     five_day_flows: dict[str, float] = {}
     for ticker in FLOW_TICKERS:
@@ -52,7 +61,7 @@ def build_flow_rrg(prices: pd.DataFrame, share_records: dict[str, pd.DataFrame])
         shares["shares_outstanding"] = pd.to_numeric(shares["shares_outstanding"], errors="coerce")
         shares = shares.dropna().query("shares_outstanding > 0").drop_duplicates("date", keep="last").set_index("date")
         shares = shares["shares_outstanding"].reindex(calendar)  # Deliberately never forward-fill.
-        close = pd.Series(pd.to_numeric(prices[ticker], errors="coerce").to_numpy(), index=calendar)
+        close = pd.Series(pd.to_numeric(prices[ticker].reindex(session_index), errors="coerce").to_numpy(), index=calendar)
         close = close.where(close.gt(0))
         flow = shares.diff().mul(close.shift(1)).where(shares.notna() & shares.shift(1).notna())
         aum = shares.mul(close)
@@ -81,7 +90,7 @@ def build_flow_rrg(prices: pd.DataFrame, share_records: dict[str, pd.DataFrame])
         observed["date"] = pd.to_datetime(observed["date"], errors="coerce").dt.normalize()
         observed["shares_outstanding"] = pd.to_numeric(observed["shares_outstanding"], errors="coerce")
         shares = observed.dropna().drop_duplicates("date", keep="last").set_index("date")["shares_outstanding"].reindex(calendar)
-        close = pd.Series(pd.to_numeric(prices[ticker], errors="coerce").to_numpy(), index=calendar)
+        close = pd.Series(pd.to_numeric(prices[ticker].reindex(session_index), errors="coerce").to_numpy(), index=calendar)
         recent_flow = shares.diff().mul(close.shift(1)).loc[:last_date].tail(5)
         if recent_flow.notna().all():
             trails[ticker] = tail

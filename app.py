@@ -25,6 +25,7 @@ import streamlit.components.v1 as components
 import yfinance as yf
 from ui_theme import inject_theme, apply_quant_theme
 from dual_rrg import FLOW_TICKERS, build_flow_rrg, flow_quadrant, convergence_label
+from sector_options import sector_option_signal
 
 try:
     from scipy.signal import argrelextrema
@@ -160,7 +161,9 @@ TACTICAL_NAMES = {
     "FCX":"Freeport-McMoRan","CPER":"Copper ETF","LMT":"Lockheed Martin","RTX":"RTX","ITA":"Aerospace & Defense ETF",
     "SMH":"Semiconductor ETF",
 }
-OPTION_POOL = ("QQQ","SPY","SMH","SOXX","NVDA","TSLA","MU","ITA","XLE")
+OPTION_POOL = ("QQQ","SPY","SMH","SOXX","NVDA","TSLA","MU","ITA","XLE","XLF","XLK")
+OPTION_LABELS = {"SMH":"SMH (VanEck 芯片龙头 ETF)","SOXX":"SOXX (iShares 费城半导体 ETF)",
+                 "XLE":"XLE (标普能源 ETF)","XLF":"XLF (标普金融 ETF)","XLK":"XLK (标普科技 ETF)"}
 LEVERAGED_ETFS = ("TQQQ","SOXL")
 PRIMARY_FLOW_ETFS = {
     "TQQQ": {"label":"TQQQ (3x 纳指)","threshold":500_000_000.0,"class":"杠杆 ETF"},
@@ -632,6 +635,32 @@ def load_theme_option_uoa(symbols: tuple[str,...]) -> pd.DataFrame:
         ["Vol/OI","Vol"],ascending=False).reset_index(drop=True)
 
 
+@st.cache_data(ttl=900,show_spinner=False)
+def load_sector_option_sentiment(symbols: tuple[str,...]) -> dict[str,dict[str,object]]:
+    """Read the scheduled, dated option snapshot once; never block Tab 01 on 13 live chains."""
+    result={symbol:{"label":"N/A · 期权链不可用","call_vol":0,"put_vol":0,"contracts":0} for symbol in symbols}
+    path=Path(__file__).resolve().parent/"data"/"options_chain_latest.csv"
+    try:
+        saved=pd.read_csv(path)
+        saved["SnapshotAtUTC"]=pd.to_datetime(saved["SnapshotAtUTC"],utc=True,errors="coerce")
+        now=pd.Timestamp.now(tz="UTC")
+        today=now.tz_convert("US/Eastern").date()
+        for symbol in symbols:
+            frame=saved[saved["Symbol"].eq(symbol)].copy()
+            if frame.empty: continue
+            newest=frame["SnapshotAtUTC"].max()
+            if pd.isna(newest) or now-newest>pd.Timedelta(days=7): continue
+            frame=frame[frame["SnapshotAtUTC"].eq(newest)]
+            spot=pd.to_numeric(frame["SpotAtCapture"],errors="coerce").dropna()
+            if spot.empty: continue
+            signal=sector_option_signal(frame,float(spot.iloc[-1]),today)
+            signal["asof_utc"]=newest.isoformat()
+            result[symbol]=signal
+    except (OSError,KeyError,ValueError,pd.errors.ParserError):
+        pass
+    return result
+
+
 def theme_tactical_scoreboard(price_frame: pd.DataFrame,ohlcv: pd.DataFrame,tickers: list[str],benchmark: str) -> pd.DataFrame:
     """Cross-sectional price, relative-strength regime and relative-volume snapshot."""
     rows=[]
@@ -936,7 +965,8 @@ def load_primary_flow(symbol: str) -> pd.DataFrame:
 
 def sector_rs_scoreboard(price_frame: pd.DataFrame) -> pd.DataFrame:
     rows=[]
-    for ticker,(name,cn_name,_) in SECTORS.items():
+    sector_specs={**SECTORS,"SMH":("Semiconductors","芯片龙头",0),"SOXX":("Semiconductors","费城半导体",0)}
+    for ticker,(name,cn_name,_) in sector_specs.items():
         if ticker not in price_frame: continue
         pair=price_frame[[ticker,"SPY"]].dropna(); ratio=pair[ticker].div(pair["SPY"])
         if len(ratio)<200: continue
@@ -1820,6 +1850,7 @@ with tab_rotation:
     selected_rrg_tickers=AI_THEMES[selected_theme]
     verified_shares=load_dual_rrg_share_records()
     flow_trails,flow_five_day=build_flow_rrg(prices,verified_shares)
+    option_signals=load_sector_option_sentiment(FLOW_TICKERS)
     price_quadrants={}
     for ticker in FLOW_TICKERS:
         if ticker in prices and rrg_benchmark in prices:
@@ -1833,14 +1864,27 @@ with tab_rotation:
         flow_zone=flow_quadrant(float(tail["flow_ratio"].iloc[-1]),float(tail["flow_momentum"].iloc[-1])) if tail is not None else "N/A"
         price_zone=price_quadrants.get(ticker,"N/A")
         five_day=flow_five_day.get(ticker,np.nan)
+        option_label=str(option_signals[ticker]["label"])
         close=prices[ticker].dropna() if ticker in prices else pd.Series(dtype=float)
         convergence_rows.append({"板块":ticker,"现价":float(close.iloc[-1]) if not close.empty else np.nan,
             "价格象限":price_zone,"资金象限":flow_zone,"5D累计净申赎 ($M)":five_day/1e6 if np.isfinite(five_day) else np.nan,
+            "Options Sentiment · 期权伏兵定性":option_label,
             "系统判定":convergence_label(price_zone,flow_zone,five_day)})
     convergence=pd.DataFrame(convergence_rows)
     early=convergence.loc[convergence["系统判定"].eq("🔥 机构抢跑起爆"),"板块"].tolist()
     traps=convergence.loc[convergence["系统判定"].eq("⚠️ 缩量虚火诱多"),"板块"].tolist()
     st.info(f"🔥 机构抢跑：{'、'.join(early) or '暂无已核实信号'}　｜　⚠️ 价格领先但资金背离：{'、'.join(traps) or '暂无已核实信号'}　｜　资金轨迹覆盖 {len(flow_trails)}/{len(FLOW_TICKERS)} 只 ETF")
+    three_dim=[]
+    now_utc=pd.Timestamp.now(tz="UTC")
+    for ticker in FLOW_TICKERS:
+        signal=option_signals[ticker]
+        observed=pd.to_datetime(signal.get("asof_utc"),utc=True,errors="coerce")
+        if (price_quadrants.get(ticker) in {"Improving","Leading"}
+            and flow_five_day.get(ticker,0)>0 and signal["label"]=="🔥 Call 抢筹伏兵"
+            and pd.notna(observed) and now_utc-observed<=pd.Timedelta(days=3)):
+            three_dim.append(ticker)
+    if three_dim:
+        st.warning(f"🚨【三维共振预警】{' / '.join(three_dim)} 检测到一级市场净申购与近虚值 Call 异动协同；属于候选信号，不能据此确认主动买入。")
     theme_crossovers=rrg_improving_crossovers(prices,selected_rrg_tickers,rrg_benchmark)
     if theme_crossovers:
         st.success(f"🎯 弱转强自动诊断：{'、'.join(theme_crossovers)} 最近3日由 Lagging 跨入 Improving。")
@@ -1920,6 +1964,32 @@ with tab_rotation:
                  use_container_width=True,hide_index=True,height=500)
     st.caption("资金流 = 相邻官方份额变动 × 前一交易日收盘价；未披露日不补零、不将二级市场成交量伪装成一级市场资金。")
 
+    section_header("RELATIVE STRENGTH",f"Theme RS vs {rrg_benchmark} · 主题相对强弱",
+                   "恢复原有相对强度图：观察期起点归一至 100，虚线为预先计算的 200 日平滑，基准锚定 100。")
+    rs_fig=go.Figure()
+    for index,ticker in enumerate(selected_rrg_tickers):
+        pair=prices[[ticker,rrg_benchmark]].dropna() if ticker in prices else pd.DataFrame()
+        if pair.empty: continue
+        ratio_full=pair[ticker].div(pair[rrg_benchmark])
+        ratio=display_window(ratio_full,rs_horizon)
+        if ratio.empty or not np.isfinite(ratio.iloc[0]) or ratio.iloc[0]==0: continue
+        color=COLORS.get(ticker,palette[index%len(palette)])
+        rebased=ratio.div(ratio.iloc[0]).mul(100)
+        rs_fig.add_trace(go.Scatter(x=rebased.index,y=rebased,mode="lines",name=ticker,
+            line=dict(color=color,width=1.6),hovertemplate=f"<b>{ticker}</b><br>%{{x|%Y-%m-%d}}<br>RS %{{y:.2f}}<extra></extra>"))
+        smooth=display_window(ratio_full.rolling(200,min_periods=200).mean().div(ratio.iloc[0]).mul(100),rs_horizon)
+        rs_fig.add_trace(go.Scatter(x=smooth.index,y=smooth,mode="lines",name=f"{ticker} 200D",showlegend=False,
+            line=dict(color=color,width=.8,dash="dot"),hoverinfo="skip"))
+    anchor=display_window(prices[rrg_benchmark].dropna(),rs_horizon)
+    if not anchor.empty:
+        rs_fig.add_trace(go.Scatter(x=anchor.index,y=np.full(len(anchor),100.0),name=f"{rrg_benchmark} ANCHOR",
+            line=dict(color="#edf2f7",width=1.8,dash="dash"),hovertemplate=f"<b>{rrg_benchmark} Anchor</b><br>%{{x|%Y-%m-%d}}<br>100.00<extra></extra>"))
+    base_layout(rs_fig,500,"x unified")
+    rs_fig.add_hline(y=100,line_dash="dash",line_color="#728198",line_width=1)
+    rs_fig.update_xaxes(title=None)
+    rs_fig.update_yaxes(title="Relative Performance · Rebased 100")
+    st.plotly_chart(rs_fig,use_container_width=True,config={"displaylogo":False})
+
     section_header("TACTICAL STOCK RADAR",f"个股多空强弱与异常量能 · {selected_theme}",f"价格、相对 {rrg_benchmark} 均线结构与 20 日相对量比；可按动能或 RVOL 快速排序。")
     try:
         theme_ohlcv=load_ohlcv(tuple(selected_rrg_tickers),"1y")
@@ -1958,7 +2028,10 @@ with tab_rotation:
         st.caption("Volume/OI 仅表示成交量相对存量异常，Yahoo 公开链不提供逐笔主动买卖与开平仓方向；‘抢筹/防守候选’需结合价格、IV 与后续 OI 复核。")
 
     scoreboard=sector_rs_scoreboard(prices)
-    section_header("SECTOR SCOREBOARD","11 大行业多空全景矩阵","各行业 ETF / SPY 相对强度与 20EMA、50EMA、200SMA 的位置关系。")
+    if not scoreboard.empty:
+        scoreboard["Options Sentiment · 期权伏兵定性"]=scoreboard["ETF"].map(
+            lambda ticker:str(option_signals.get(ticker,{}).get("label","N/A · 期权链不可用")))
+    section_header("SECTOR SCOREBOARD","行业与芯片 ETF 多空全景矩阵","相对 SPY 的 20/50/200 日均线结构，叠加近月虚值期权成交量异常。")
     score_sort=st.radio("状态排序",["默认行业顺序","强 → 弱","弱 → 强"],horizontal=True,key="scoreboard_sort")
     if not scoreboard.empty and score_sort!="默认行业顺序":
         regime_rank={"🔥 绝对强势":4,"⚡ 超跌反弹":3,"🔄 均线过渡":2,"⚠️ 强势回调":1,"❄️ 弱势破位":0}
@@ -1969,6 +2042,7 @@ with tab_rotation:
         score_style=scoreboard.style.format({"RS vs 20EMA":"{:+.2f}%","RS vs 50EMA":"{:+.2f}%","RS vs 200SMA":"{:+.2f}%"},na_rep="—").map(
             color_return,subset=["RS vs 20EMA","RS vs 50EMA","RS vs 200SMA"])
         st.dataframe(score_style,use_container_width=True,hide_index=True,height=455)
+        st.caption("板块期权伏兵来自已标记 UTC 时间的链快照：7–30 DTE、现价 ±10% 内虚值合约，Vol > 1.5×OI 且 Vol ≥ 1000；N/A 表示链不可用。Volume/OI 不证明主动买入或新开仓。")
 
 with tab_market:
     tape_tab, ndx_tab, matrix_tab = st.tabs(["MARKET BREADTH TAPE", "NDX LEADERS", "SECTOR MATRIX"])
@@ -2594,7 +2668,8 @@ with tab_options:
     with option_head:
         section_header("OPTIONS INTELLIGENCE","Options UOA & Gamma · 期权异动雷达","扫描7–30 DTE 虚值合约；所有链路均独立容错并受15分钟缓存保护。")
     with option_control:
-        option_symbol=st.selectbox("Underlying",OPTION_POOL,key="option_radar_symbol")
+        option_symbol=st.selectbox("Underlying",OPTION_POOL,key="option_radar_symbol",
+                                   format_func=lambda symbol:OPTION_LABELS.get(symbol,symbol))
     with moneyness_control:
         moneyness_pct=st.slider("行权价偏离范围 · Strike Moneyness",10,30,15,5,format="±%d%%",key="uoa_moneyness")
     try:

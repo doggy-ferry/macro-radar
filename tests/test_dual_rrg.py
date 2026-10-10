@@ -34,6 +34,15 @@ class DualRRGTests(unittest.TestCase):
         trails, _ = build_flow_rrg(self.prices, records)
         self.assertNotIn("XLK", trails)
 
+    def test_non_us_union_dates_do_not_stale_official_flow(self):
+        quotes = self.prices.copy()
+        quotes["SPY"] = np.linspace(400, 410, len(quotes))
+        quotes["EXTRA"] = 1.0
+        weekend = self.dates[-1] + pd.Timedelta(days=2)
+        quotes = pd.concat([quotes, pd.DataFrame({"SPY": [np.nan], "EXTRA": [2.0]}, index=[weekend])])
+        trails, _ = build_flow_rrg(quotes, self.records)
+        self.assertIn("XLK", trails)
+
     def test_convergence_rules(self):
         self.assertEqual(flow_quadrant(99, 101), "Improving")
         self.assertEqual(convergence_label("Lagging", "Improving", 1), "🔥 机构抢跑起爆")

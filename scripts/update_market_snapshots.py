@@ -25,7 +25,8 @@ DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; BuySideQuantPortal/1.0)"}
 FLOW_COLUMNS = ["date", "shares_outstanding", "nav", "source_url", "source_note"]
-OPTION_SYMBOLS = ("QQQ", "SPY", "SMH", "SOXX", "NVDA", "TSLA", "MU", "ITA", "XLE")
+OPTION_SYMBOLS = ("QQQ", "SPY", "SMH", "SOXX", "NVDA", "TSLA", "MU", "ITA",
+                  "XLK", "XLE", "XLF", "XLI", "XLY", "XLC", "XLV", "XLP", "XLU", "XLRE", "XLB")
 SECTOR_SHARE_SYMBOLS = ("XLK", "XLE", "XLF", "XLI", "XLY", "XLC", "XLV", "XLP", "XLU", "XLRE", "XLB")
 OPTION_COLUMNS = ["Symbol", "SnapshotAtUTC", "SpotAtCapture", "Expiration", "Type",
                   "contractSymbol", "strike", "lastPrice", "bid", "ask", "volume",
