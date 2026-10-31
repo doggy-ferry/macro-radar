@@ -7,4 +7,4 @@ date,shares_outstanding,nav,source_url,source_note
 2026-10-23,675600000,704.34904,https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/46090E103/prices?idType=cusip&productType=ETF&variationType=priceListing&productSubType=ETF,Invesco official QQQ prices API
 2026-10-26,669450000,712.035287,https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/46090E103/prices?idType=cusip&productType=ETF&variationType=priceListing&productSubType=ETF,Invesco official QQQ prices API
 2026-10-27,669650000,721.231317,https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/46090E103/prices?idType=cusip&productType=ETF&variationType=priceListing&productSubType=ETF,Invesco official QQQ prices API
-2026-10-29,675600000,725.170742,https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/46090E103/prices?idType=cusip&productType=ETF&variationType=priceListing&productSubType=ETF,Invesco official QQQ prices API
+2026-10-29,672400000,715.178947,https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/46090E103/prices?idType=cusip&productType=ETF&variationType=priceListing&productSubType=ETF,Invesco official QQQ prices API
